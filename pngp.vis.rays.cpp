@@ -45,8 +45,8 @@ namespace {
             return;
         }
 
-        s->dx += float(x - s->last_x);
-        s->dy += float(y - s->last_y);
+        s->dx += static_cast<float>(x - s->last_x);
+        s->dy += static_cast<float>(y - s->last_y);
 
         s->last_x = x;
         s->last_y = y;
@@ -55,7 +55,7 @@ namespace {
     void glfw_scroll_cb(GLFWwindow* w, double, double yoff) {
         auto* s = static_cast<InputState*>(glfwGetWindowUserPointer(w));
         if (!s) return;
-        s->scroll += float(yoff);
+        s->scroll += static_cast<float>(yoff);
     }
 
     struct GridPush {
@@ -67,7 +67,7 @@ namespace {
     vk::memory::MeshCPU<vk::geometry::VertexP3C4> build_ground_plane(const float extent) {
         vk::memory::MeshCPU<vk::geometry::VertexP3C4> mesh{};
         const float clamped_extent = std::max(0.1f, extent);
-        const vk::math::vec4 color{1.0f, 1.0f, 1.0f, 1.0f};
+        constexpr vk::math::vec4 color{1.0f, 1.0f, 1.0f, 1.0f};
 
         mesh.vertices = {
             {{-clamped_extent, 0.0f, -clamped_extent, 0.0f}, color},
@@ -80,12 +80,9 @@ namespace {
         return mesh;
     }
 
-    vk::memory::MeshGPU upload_mesh_safe(
-        const vk::context::VulkanContext& vkctx,
-        const vk::memory::MeshCPU<vk::geometry::VertexP3C4>& mesh) {
+    vk::memory::MeshGPU upload_mesh_safe(const vk::context::VulkanContext& vkctx, const vk::memory::MeshCPU<vk::geometry::VertexP3C4>& mesh) {
         if (mesh.vertices.empty() || mesh.indices.empty()) return {};
-        return vk::memory::upload_mesh(vkctx.physical_device, vkctx.device, vkctx.command_pool,
-                                       vkctx.graphics_queue, mesh);
+        return vk::memory::upload_mesh(vkctx.physical_device, vkctx.device, vkctx.command_pool, vkctx.graphics_queue, mesh);
     }
 
     std::vector<std::byte> read_shader_bytes(std::span<const char* const> paths) {
@@ -109,15 +106,13 @@ namespace {
         GridPush push{};
         push.mvp     = mvp;
         push.grid    = {step, step * major, extent, std::max(0.001f, grid.axis_length)};
-        push.toggles = {std::max(0.001f, grid.origin_scale), grid.show_grid ? 1.0f : 0.0f,
-                        grid.show_axes ? 1.0f : 0.0f, grid.show_origin ? 1.0f : 0.0f};
+        push.toggles = {std::max(0.001f, grid.origin_scale), grid.show_grid ? 1.0f : 0.0f, grid.show_axes ? 1.0f : 0.0f, grid.show_origin ? 1.0f : 0.0f};
         return push;
     }
 
-    vk::pipeline::GraphicsPipeline create_grid_pipeline(const vk::context::VulkanContext& vkctx,
-                                                        const vk::swapchain::Swapchain& sc) {
+    vk::pipeline::GraphicsPipeline create_grid_pipeline(const vk::context::VulkanContext& vkctx, const vk::swapchain::Swapchain& sc) {
         const auto vin = vk::pipeline::make_vertex_input<vk::geometry::VertexP3C4>();
-        const std::array paths{"shaders/ground_grid.spv", "../shaders/ground_grid.spv"};
+        constexpr std::array paths{"shaders/ground_grid.spv", "../shaders/ground_grid.spv"};
         const auto spv = read_shader_bytes(paths);
         auto shader    = vk::pipeline::load_shader_module(vkctx.device, spv);
 
@@ -132,8 +127,7 @@ namespace {
         desc.enable_blend         = true;
         desc.push_constant_bytes  = sizeof(GridPush);
         desc.push_constant_stages = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
-        return vk::pipeline::create_graphics_pipeline(vkctx.device, vin, desc, shader, "vertMain",
-                                                      "fragMain");
+        return vk::pipeline::create_graphics_pipeline(vkctx.device, vin, desc, shader, "vertMain", "fragMain");
     }
 } // namespace
 
@@ -167,11 +161,10 @@ void pngp::vis::rays::RaysInspector::run() {
         vk::frame::begin_commands(frames, frame_index);
         vk::imgui::begin_frame();
 
-        const bool rebuild_mesh = imgui_panel();
-        if (rebuild_mesh) {
+        if (imgui_panel()) {
             ctx.device.waitIdle();
             const auto mesh_cpu = build_ground_plane(grid.grid_extent);
-            grid_mesh = upload_mesh_safe(ctx, mesh_cpu);
+            grid_mesh           = upload_mesh_safe(ctx, mesh_cpu);
         }
 
         cam.set_mode(grid.fly_mode ? vk::camera::Mode::Fly : vk::camera::Mode::Orbit);
@@ -227,8 +220,8 @@ void pngp::vis::rays::RaysInspector::run() {
 pngp::vis::rays::RaysInspector::RaysInspector(const RaysInspectorInfo& info) {
     auto [vkctx, surface] = vk::context::setup_vk_context_glfw("Dataset Viewer", "Engine");
 
-    this->ctx       = std::move(vkctx);
-    this->surface   = std::move(surface);
+    this->ctx     = std::move(vkctx);
+    this->surface = std::move(surface);
     glfwSetWindowUserPointer(this->surface.window.get(), &this->input);
     glfwSetKeyCallback(this->surface.window.get(), &glfw_key_cb);
     glfwSetMouseButtonCallback(this->surface.window.get(), &glfw_mouse_button_cb);
@@ -247,14 +240,14 @@ pngp::vis::rays::RaysInspector::RaysInspector(const RaysInspectorInfo& info) {
     cam.home();
     cam.set_mode(vk::camera::Mode::Orbit);
     {
-        auto st = cam.state();
+        auto st           = cam.state();
         st.orbit.distance = std::max(1.0f, grid.grid_extent * 1.15f);
         cam.set_state(st);
     }
 
     const auto mesh_cpu = build_ground_plane(grid.grid_extent);
-    grid_mesh = upload_mesh_safe(ctx, mesh_cpu);
-    grid_pipeline = create_grid_pipeline(ctx, swapchain);
+    grid_mesh           = upload_mesh_safe(ctx, mesh_cpu);
+    grid_pipeline       = create_grid_pipeline(ctx, swapchain);
 }
 void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, std::uint32_t image_index) {
     auto& cmd = vk::frame::cmd(this->frames, frame_index);
@@ -349,9 +342,7 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
     if (grid_mesh.index_count > 0 && grid_visible) {
         cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *grid_pipeline.pipeline);
         const GridPush push = make_grid_push(grid, grid_mvp);
-        cmd.pushConstants(*grid_pipeline.layout,
-                          vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-                          vk::ArrayProxy<const GridPush>{push});
+        cmd.pushConstants(*grid_pipeline.layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, vk::ArrayProxy<const GridPush>{push});
 
         vk::DeviceSize offset = 0;
         cmd.bindVertexBuffers(0, {*grid_mesh.vertex_buffer.buffer}, {offset});
