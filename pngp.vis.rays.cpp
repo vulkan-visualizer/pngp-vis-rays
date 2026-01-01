@@ -4,16 +4,25 @@ module;
 
 #include <vulkan/vulkan_raii.hpp>
 module pngp.vis.rays;
+// ============================================================================
+// RaysInspector implementation.
+// ============================================================================
 import std;
 import vk.pipeline;
 import vk.memory;
 import vk.geometry;
 import vk.math;
 
+// ============================================================================
+// Translation-unit helpers (input callbacks, grid helpers, pipeline setup).
+// ============================================================================
 namespace {
     using pngp::vis::rays::GridSettings;
     using pngp::vis::rays::InputState;
 
+    // =========================================================================
+    // GLFW input callbacks: collect raw input into InputState.
+    // =========================================================================
     void glfw_key_cb(GLFWwindow* w, int key, int, int action, int) {
         auto* s = static_cast<InputState*>(glfwGetWindowUserPointer(w));
         if (!s) return;
@@ -58,12 +67,18 @@ namespace {
         s->scroll += static_cast<float>(yoff);
     }
 
+    // =========================================================================
+    // Push constants consumed by ground_grid.slang.
+    // =========================================================================
     struct GridPush {
         vk::math::mat4 mvp{};
         vk::math::vec4 grid{};
         vk::math::vec4 toggles{};
     };
 
+    // =========================================================================
+    // Single quad for the grid surface; shader draws the lines procedurally.
+    // =========================================================================
     vk::memory::MeshCPU<vk::geometry::VertexP3C4> build_ground_plane(const float extent) {
         vk::memory::MeshCPU<vk::geometry::VertexP3C4> mesh{};
         const float clamped_extent = std::max(0.1f, extent);
@@ -80,11 +95,17 @@ namespace {
         return mesh;
     }
 
+    // =========================================================================
+    // Helper that returns an empty GPU mesh if CPU data is empty.
+    // =========================================================================
     vk::memory::MeshGPU upload_mesh_safe(const vk::context::VulkanContext& vkctx, const vk::memory::MeshCPU<vk::geometry::VertexP3C4>& mesh) {
         if (mesh.vertices.empty() || mesh.indices.empty()) return {};
         return vk::memory::upload_mesh(vkctx.physical_device, vkctx.device, vkctx.command_pool, vkctx.graphics_queue, mesh);
     }
 
+    // =========================================================================
+    // Load SPIR-V from first available path (build dir or repo root).
+    // =========================================================================
     std::vector<std::byte> read_shader_bytes(std::span<const char* const> paths) {
         std::exception_ptr last_error;
         for (const char* path : paths) {
@@ -98,6 +119,9 @@ namespace {
         throw std::runtime_error("ground_grid.spv not found");
     }
 
+    // =========================================================================
+    // Convert UI settings to shader-friendly constants.
+    // =========================================================================
     GridPush make_grid_push(const GridSettings& grid, const vk::math::mat4& mvp) {
         const float step   = std::max(0.001f, grid.grid_step);
         const float extent = std::max(0.1f, grid.grid_extent);
@@ -110,6 +134,9 @@ namespace {
         return push;
     }
 
+    // =========================================================================
+    // Minimal pipeline for a transparent grid surface with depth testing.
+    // =========================================================================
     vk::pipeline::GraphicsPipeline create_grid_pipeline(const vk::context::VulkanContext& vkctx, const vk::swapchain::Swapchain& sc) {
         const auto vin = vk::pipeline::make_vertex_input<vk::geometry::VertexP3C4>();
         constexpr std::array paths{"shaders/ground_grid.spv", "../shaders/ground_grid.spv"};
@@ -131,11 +158,18 @@ namespace {
     }
 } // namespace
 
+// ============================================================================
+// App entry point.
+// ============================================================================
 int main() {
     pngp::vis::rays::RaysInspector app{{}};
     app.run();
     return 0;
 }
+
+// ============================================================================
+// Main loop: poll input, update camera, draw, and present.
+// ============================================================================
 void pngp::vis::rays::RaysInspector::run() {
     std::uint32_t frame_index = 0;
     using clock               = std::chrono::steady_clock;
@@ -143,14 +177,23 @@ void pngp::vis::rays::RaysInspector::run() {
     while (!glfwWindowShouldClose(surface.window.get())) {
         glfwPollEvents();
 
+        // ====================================================================
+        // Frame timing with a small clamp to keep camera stable.
+        // ====================================================================
         auto t_now = clock::now();
         float dt   = std::chrono::duration<float>(t_now - t_prev).count();
         t_prev     = t_now;
         if (!(dt > 0.0f)) dt = 1.0f / 60.0f;
         dt = std::min(dt, 0.05f);
 
+        // ====================================================================
+        // Acquire swapchain image and sync to start a new frame.
+        // ====================================================================
         const auto ar = vk::frame::begin_frame(ctx, swapchain, frames, frame_index);
         if (!ar.ok || ar.need_recreate) {
+            // =================================================================
+            // Swapchain is invalid (resize/minimize). Recreate dependent resources.
+            // =================================================================
             vk::swapchain::recreate_swapchain(ctx, surface, swapchain);
             vk::frame::on_swapchain_recreated(ctx, swapchain, frames);
             vk::imgui::set_min_image_count(imgui, 2);
@@ -159,20 +202,34 @@ void pngp::vis::rays::RaysInspector::run() {
             continue;
         }
         vk::frame::begin_commands(frames, frame_index);
+
+        // ====================================================================
+        // Start a new ImGui frame so UI can collect input state.
+        // ====================================================================
         vk::imgui::begin_frame();
 
-        if (imgui_panel()) {
+        // ====================================================================
+        // Build the UI and decide whether the grid geometry needs rebuild.
+        // ====================================================================
+        const bool rebuild_mesh = imgui_panel();
+        if (rebuild_mesh) {
             ctx.device.waitIdle();
             const auto mesh_cpu = build_ground_plane(grid.grid_extent);
             grid_mesh           = upload_mesh_safe(ctx, mesh_cpu);
         }
 
+        // ====================================================================
+        // Apply camera mode and prepare input for the controller.
+        // ====================================================================
         cam.set_mode(grid.fly_mode ? vk::camera::Mode::Fly : vk::camera::Mode::Orbit);
 
         const ImGuiIO& io      = ImGui::GetIO();
         const bool block_mouse = io.WantCaptureMouse;
         const bool block_kbd   = io.WantCaptureKeyboard;
 
+        // ====================================================================
+        // Respect ImGui capture flags so the UI can own the mouse/keyboard.
+        // ====================================================================
         vk::camera::CameraInput ci{};
         ci.lmb = (!block_mouse) && input.lmb;
         ci.mmb = (!block_mouse) && input.mmb;
@@ -194,16 +251,32 @@ void pngp::vis::rays::RaysInspector::run() {
         ci.down     = (!block_kbd) && input.keys[GLFW_KEY_Q];
         ci.up       = (!block_kbd) && input.keys[GLFW_KEY_E];
 
+        // ====================================================================
+        // Update camera matrices (view/projection) for this frame.
+        // ====================================================================
         cam.update(dt, swapchain.extent.width, swapchain.extent.height, ci);
         vk::imgui::draw_mini_axis_gizmo(cam.matrices().c2w);
 
+        // ====================================================================
+        // Consume per-frame deltas so callbacks accumulate fresh movement.
+        // ====================================================================
         input.dx     = 0.0f;
         input.dy     = 0.0f;
         input.scroll = 0.0f;
 
+        // ====================================================================
+        // Cache per-frame MVP for the grid draw call.
+        // ====================================================================
         grid_mvp = cam.matrices().view_proj;
 
+        // ====================================================================
+        // Record GPU work for this frame (grid + ImGui).
+        // ====================================================================
         record_commands(frame_index, ar.image_index);
+
+        // ====================================================================
+        // Present the frame; recreate swapchain if presentation fails.
+        // ====================================================================
         if (vk::frame::end_frame(ctx, swapchain, frames, frame_index, ar.image_index)) {
             vk::swapchain::recreate_swapchain(ctx, surface, swapchain);
             vk::frame::on_swapchain_recreated(ctx, swapchain, frames);
@@ -214,24 +287,35 @@ void pngp::vis::rays::RaysInspector::run() {
 
         frame_index = (frame_index + 1) % frames.frames_in_flight;
     }
-    this->ctx.device.waitIdle();
+    ctx.device.waitIdle();
     vk::imgui::shutdown(imgui);
 }
+
+// ============================================================================
+// Constructor: create Vulkan systems and the initial grid resources.
+// ============================================================================
 pngp::vis::rays::RaysInspector::RaysInspector(const RaysInspectorInfo& info) {
     auto [vkctx, surface] = vk::context::setup_vk_context_glfw("Dataset Viewer", "Engine");
 
-    this->ctx     = std::move(vkctx);
+    ctx           = std::move(vkctx);
     this->surface = std::move(surface);
-    glfwSetWindowUserPointer(this->surface.window.get(), &this->input);
+
+    // ========================================================================
+    // Connect GLFW callbacks before ImGui init so it can chain them.
+    // ========================================================================
+    glfwSetWindowUserPointer(this->surface.window.get(), &input);
     glfwSetKeyCallback(this->surface.window.get(), &glfw_key_cb);
     glfwSetMouseButtonCallback(this->surface.window.get(), &glfw_mouse_button_cb);
     glfwSetCursorPosCallback(this->surface.window.get(), &glfw_cursor_pos_cb);
     glfwSetScrollCallback(this->surface.window.get(), &glfw_scroll_cb);
 
-    this->swapchain = vk::swapchain::setup_swapchain(this->ctx, this->surface);
-    this->frames    = vk::frame::create_frame_system(this->ctx, this->swapchain, 2);
-    this->imgui     = vk::imgui::create(this->ctx, this->surface.window.get(), this->swapchain.format, 2, static_cast<std::uint32_t>(this->swapchain.images.size()), info.render.enable_docking, info.render.enable_viewports);
+    swapchain = vk::swapchain::setup_swapchain(ctx, this->surface);
+    frames    = vk::frame::create_frame_system(ctx, swapchain, 2);
+    imgui     = vk::imgui::create(ctx, this->surface.window.get(), swapchain.format, 2, static_cast<std::uint32_t>(swapchain.images.size()), info.render.enable_docking, info.render.enable_viewports);
 
+    // ========================================================================
+    // Camera defaults tuned for a comfortable workspace view.
+    // ========================================================================
     vk::camera::CameraConfig cam_cfg{};
     cam_cfg.fov_y_rad = info.render.fov_y_rad;
     cam_cfg.znear     = info.render.near_plane;
@@ -245,14 +329,23 @@ pngp::vis::rays::RaysInspector::RaysInspector(const RaysInspectorInfo& info) {
         cam.set_state(st);
     }
 
+    // ========================================================================
+    // Create grid resources once at startup.
+    // ========================================================================
     const auto mesh_cpu = build_ground_plane(grid.grid_extent);
     grid_mesh           = upload_mesh_safe(ctx, mesh_cpu);
     grid_pipeline       = create_grid_pipeline(ctx, swapchain);
 }
+
+// ============================================================================
+// Record a frame: render grid, then ImGui.
+// ============================================================================
 void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, std::uint32_t image_index) {
-    auto& cmd = vk::frame::cmd(this->frames, frame_index);
+    auto& cmd = vk::frame::cmd(frames, frame_index);
 
-
+    // ========================================================================
+    // Transition swapchain color image for rendering.
+    // ========================================================================
     {
         const vk::ImageMemoryBarrier2 barrier{
             .srcStageMask     = vk::PipelineStageFlagBits2::eTopOfPipe,
@@ -273,7 +366,9 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
         frames.swapchain_image_layout[image_index] = vk::ImageLayout::eColorAttachmentOptimal;
     }
 
-
+    // ========================================================================
+    // Transition depth image for depth testing.
+    // ========================================================================
     {
         const vk::ImageMemoryBarrier2 barrier{
             .srcStageMask     = vk::PipelineStageFlagBits2::eTopOfPipe,
@@ -294,6 +389,9 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
         swapchain.depth_layout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
     }
 
+    // ========================================================================
+    // Clear targets: black background + default depth.
+    // ========================================================================
     vk::ClearValue clear_color{};
     clear_color.color = vk::ClearColorValue{std::array{0.f, 0.f, 0.f, 1.0f}};
 
@@ -338,6 +436,10 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
 
     cmd.setViewport(0, {vp});
     cmd.setScissor(0, {scissor});
+
+    // ========================================================================
+    // Grid draw: one quad + procedural shader.
+    // ========================================================================
     const bool grid_visible = grid.show_grid || grid.show_axes || grid.show_origin;
     if (grid_mesh.index_count > 0 && grid_visible) {
         cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *grid_pipeline.pipeline);
@@ -352,10 +454,15 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
 
     cmd.endRendering();
 
+    // ========================================================================
+    // ImGui pass (draw UI on top of scene).
+    // ========================================================================
     vk::imgui::render(imgui, cmd, swapchain.extent, *swapchain.image_views[image_index], vk::ImageLayout::eColorAttachmentOptimal);
     vk::imgui::end_frame();
 
-
+    // ========================================================================
+    // Transition swapchain image for presentation.
+    // ========================================================================
     {
         const vk::ImageMemoryBarrier2 barrier{
             .srcStageMask     = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
@@ -376,6 +483,10 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
         frames.swapchain_image_layout[image_index] = vk::ImageLayout::ePresentSrcKHR;
     }
 }
+
+// ============================================================================
+// ImGui panel: return true when geometry should be rebuilt.
+// ============================================================================
 bool pngp::vis::rays::RaysInspector::imgui_panel() {
     bool rebuild = false;
     ImGui::Begin("Rays Inspector");
