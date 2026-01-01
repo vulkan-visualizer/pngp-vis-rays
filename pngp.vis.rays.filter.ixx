@@ -10,6 +10,24 @@ import vk.pipeline;
 import vk.memory;
 import pngp.vis.rays.record;
 
+namespace {
+    // ========================================================================
+    // Load SPIR-V from the first available path.
+    // ========================================================================
+    std::vector<std::byte> read_spv_bytes(std::span<const char* const> paths) {
+        std::exception_ptr last_error;
+        for (const char* path : paths) {
+            try {
+                return vk::pipeline::read_file_bytes(path);
+            } catch (...) {
+                last_error = std::current_exception();
+            }
+        }
+        if (last_error) std::rethrow_exception(last_error);
+        throw std::runtime_error("filter: shader not found");
+    }
+} // namespace
+
 namespace pngp::vis::rays::filter {
     // ========================================================================
     // Push constants for the compute shader.
@@ -55,8 +73,9 @@ namespace pngp::vis::rays::filter {
     // ========================================================================
     // Pipeline + descriptor setup.
     // ========================================================================
-    export [[nodiscard]] FilterPipeline create_filter_pipeline(const vk::raii::Device& device,
-                                                              const vk::Format) {
+    export [[nodiscard]] FilterPipeline create_filter_pipeline_from_paths(
+        const vk::raii::Device& device,
+        std::span<const char* const> paths) {
         const vk::DescriptorSetLayoutBinding bindings[] = {
             {
                 .binding         = 0,
@@ -101,7 +120,7 @@ namespace pngp::vis::rays::filter {
 
         out.layout = vk::raii::PipelineLayout{device, layout_ci};
 
-        const auto spv = vk::pipeline::read_file_bytes("../shaders/ray_filter.spv");
+        const auto spv = read_spv_bytes(paths);
         const auto shader = vk::pipeline::load_shader_module(device, spv);
 
         const vk::PipelineShaderStageCreateInfo stage{
@@ -117,6 +136,15 @@ namespace pngp::vis::rays::filter {
 
         out.pipeline = vk::raii::Pipeline{device, nullptr, ci};
         return out;
+    }
+
+    export [[nodiscard]] FilterPipeline create_filter_pipeline(const vk::raii::Device& device,
+                                                              const vk::Format) {
+        constexpr std::array paths{
+            "../shaders/ray_filter.spv",
+            "../shaders/ray_filter.spv",
+        };
+        return create_filter_pipeline_from_paths(device, paths);
     }
 
     export [[nodiscard]] FilterBindings create_filter_bindings(const vk::raii::Device& device) {

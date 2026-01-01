@@ -12,6 +12,7 @@ import vk.memory;
 import vk.geometry;
 import vk.math;
 import pngp.vis.rays.record;
+import pngp.vis.rays.record_v2;
 import pngp.vis.rays.playback;
 import pngp.vis.rays.filter;
 import std;
@@ -134,6 +135,12 @@ namespace pngp::vis::rays {
         playback::RayPlayback playback{};
         record::FrameHeader active_frame{};
         std::size_t active_frame_index = 0;
+        record_v2::RecordReaderV2 record_v2_reader{};
+        record_v2::FrameViewV2 v2_view{};
+        record_v2::FrameIndexEntryV2 active_frame_v2{};
+        bool record_v2_active = false;
+        int v2_ray_index = 0;
+        int v2_sample_index = 0;
 
         playback::RayBufferGPU ray_input{};
         vk::memory::Buffer ray_filtered{};
@@ -150,6 +157,8 @@ namespace pngp::vis::rays {
         vk::raii::DescriptorPool ray_pool{nullptr};
         vk::raii::DescriptorSet ray_set{nullptr};
         vk::pipeline::GraphicsPipeline ray_pipeline;
+        vk::pipeline::GraphicsPipeline ray_pipeline_v2;
+        filter::FilterPipeline filter_pipeline_v2{};
         // ====================================================================
         // UI + playback state.
         // ====================================================================

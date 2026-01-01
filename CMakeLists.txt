@@ -107,6 +107,7 @@ target_sources(pngp-vis-rays
         PUBLIC FILE_SET cxx_modules TYPE CXX_MODULES FILES
         pngp.vis.rays.ixx
         pngp.vis.rays.record.ixx
+        pngp.vis.rays.record_v2.ixx
         pngp.vis.rays.playback.ixx
         pngp.vis.rays.filter.ixx
 )

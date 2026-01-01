@@ -23,3 +23,20 @@ add_executable(ray_generator
 
 target_include_directories(ray_generator PRIVATE include)
 set_target_properties(ray_generator PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(ray_generator_v2
+        src/main_v2.cpp
+        src/ray_generator.cu
+)
+target_include_directories(ray_generator_v2 PRIVATE include)
+set_target_properties(ray_generator_v2 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(record_schema_v2_layout
+        tests/record_schema_v2_layout.cpp
+)
+target_include_directories(record_schema_v2_layout PRIVATE include)
+
+add_executable(record_validate_v2
+        src/record_validate_v2.cpp
+)
+target_include_directories(record_validate_v2 PRIVATE include)

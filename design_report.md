@@ -1,165 +1,192 @@
 # design_report.md
 
-NeRF Ray Generator Debug Tool - Design Report
+NeRF Ray Debugger - Design Report (Revised)
 
 Purpose
-This document proposes multiple architecture solutions for a modern, elegant ray-generator debug tool that replays records captured by the NeRF training app. The tool is read-only and focuses on visualization and inspection.
+Build a debug tool that inspects NeRF rendering at the smallest unit: a single
+ray. Each ray can carry rich, per-sample debug data (kept/omitted, occupancy
+reasons, contribution to final pixel, termination logic), and the tool must
+visualize and filter those data interactively.
 
 Goals
-- Play back recorded NeRF ray-generation data at interactive rates.
-- Provide precise inspection of ray origins, directions, samples, and per-sample metadata.
-- Offer timeline scrubbing and deterministic, frame-accurate replay.
-- Support modern Vulkan 1.3+ rendering with clean GPU/CPU separation.
-- Keep the UX focused: fast iteration for debugging.
+- Per-ray and per-sample inspection, with deterministic replay.
+- Random access to frames and per-ray data.
+- GPU-first rendering for large datasets.
+- Extensible schema to evolve with NeRF pipeline changes.
 
 Non-Goals
-- Re-implement NeRF training or inference.
-- Online streaming from the training app (unless explicitly requested later).
-- Long-term storage management beyond reading recorded assets.
-
-Assumptions About Recorded Data
-- Records contain a sequence of frames (or steps), each with camera state + per-ray data.
-- Camera data: intrinsics, extrinsics, resolution, frame index/time.
-- Ray data: origin, direction, per-ray attributes (e.g., pixel id, mask, batch id).
-- Sample data (optional): t values, densities, colors, weights, hit flags.
-
-Common Feature Set (All Solutions)
-- Timeline: play/pause/step, scrub by frame or time.
-- Camera inspection: render pose frustum + per-frame camera metadata.
-- Ray visualization: show subsets of rays, ray bundles, or per-pixel rays.
-- Ray filtering: spatial bounds, pixel region, random sampling, batch id.
-- Buffer statistics: counts, min/max, histograms for weights or densities.
-- Export: screenshot and CSV/JSON dump for selected rays.
-
-Data Model (Suggested)
-- RecordHeader:
-  - version, endianness, compression, schema hash
-  - global camera model and dataset metadata
-- FrameHeader:
-  - frame index, timestamp, camera pose, intrinsics
-  - ray count and offsets into ray/sample arrays
-- RayBuffer:
-  - origin, direction, pixel id, extra attributes
-- SampleBuffer (optional):
-  - per-ray sample arrays or concatenated sample stream with per-ray offsets
-
-Data Format Options
-- Binary chunk file with per-frame offsets + zstd compression (fast, compact).
-- Flat binary arrays + JSON index for quick iteration.
-- Flatbuffers/Cap'n Proto for strict schema + backward compatibility.
+- Training or inference.
+- Online streaming (unless explicitly requested later).
 
 ---------------------------------------------------------------------
-Solution A: Minimal Playback (CPU-centric)
+Current Implementation Status (Baseline v1)
 ---------------------------------------------------------------------
+Schema + IO
+- [done] Binary v1 schema (RecordHeader + FrameHeader + contiguous ray buffer).
+- [done] Random-access loader for frames and rays.
+- [done] CUDA-based independent ray generator (v1-compatible output).
+
+Rendering + UI
+- [done] Ground grid + axes + camera modes.
+- [done] Ray line rendering from storage buffers.
+- [done] Instanced indirect draw (2 verts per ray instance).
+- [done] UI for record loading, frame selection, stride/max filters.
+
+GPU Filtering
+- [done] Compute filter + indirect draw build.
+- [done] Cached filtering (recompute only when inputs change).
+
+Notes
+- v1 schema is minimal (ray origin/direction + pixel id). It cannot store rich
+  per-sample debug data. The v2 schema below addresses this.
+
+---------------------------------------------------------------------
+Proposed Data Schema v2 (Ray-Centric Debug)
+---------------------------------------------------------------------
+Design Goals
+- Deep per-ray inspection with variable sample counts.
+- Extensible attributes without breaking old readers.
+- Fast random access to frames and rays.
+- GPU-friendly layout (alignment, optional SoA).
+
+High-Level File Layout
+1) RecordHeaderV2
+2) FrameIndex table (frame_count entries)
+3) Section table (typed sections with offsets + sizes)
+4) String table (names for attributes, reasons, labels)
+5) Section payloads (ray data, sample data, debug data, etc.)
+
+Core Types (Fixed Layout, 16-byte aligned)
+RecordHeaderV2
+- magic[4], version_major/minor, endian, compression
+- header_bytes, frame_count
+- frame_index_offset, section_table_offset, string_table_offset
+- schema_hash (for validation), flags, reserved
+
+FrameIndexEntryV2
+- frame_index, timestamp_sec
+- width, height
+- fx, fy, cx, cy
+- c2w_3x4[12]
+- section_offset, section_count
+- reserved
+
+RayBaseRecordV2
+- origin_xyz (float3) + pad
+- dir_xyz (float3) + pad
+- pixel_x, pixel_y, ray_flags, pad
+- sample_offset (uint32)  // into sample stream
+- sample_count  (uint32)
+- result_index  (uint32)  // into RayResult section
+- pad
+
+SampleRecordV2 (candidate samples, including omitted)
+- t, dt (float)           // sample position and step
+- level, mip (uint16)     // optional LOD/level info
+- state (uint8)           // kept/omitted/terminated
+- omit_reason (uint8)     // occupancy, alpha, bounds, etc.
+- ray_index (uint32)      // back-reference
+- rng_seed (uint32)       // optional for debugging
+- pad
+
+SampleEvalV2 (evaluation results for kept samples)
+- density (float)
+- color_rgb (float3)
+- weight (float)
+- transmittance (float)
+- contrib_rgb (float3)    // contribution to final pixel
+- pad
+
+RayResultV2
+- final_rgb (float3)
+- final_alpha (float)
+- depth (float)
+- termination_reason (uint32)
+- step_count (uint32)
+- pad
+
+Attribute Streams (Extensible)
+AttributeStreamDesc
+- target (ray/sample/result)
+- name_offset (string table)
+- format (u8/u16/u32/f16/f32), components (1..4)
+- count, stride, offset, compression
+
+This allows adding new per-ray/per-sample debug attributes without modifying
+fixed structs. Example streams:
+- ray_mask_id, ray_batch_id, ray_importance
+- sample_sigma_unclamped, sample_gradient_norm
+- occupancy_cell_id, skip_distance, sdf_value
+
+Compression + Alignment
+- Each section can be independently compressed (zstd) or raw.
+- Section payloads aligned to 16 bytes.
+- Optional SoA layout for very large sample attributes.
+
+Compatibility Strategy
+- Keep v1 reader for existing records.
+- v2 files carry a schema_hash and a section table for robust evolution.
+- Tool can detect v1 vs v2 via header version + magic.
+
+---------------------------------------------------------------------
+Future Implementation Paths (Choose One or Combine)
+---------------------------------------------------------------------
+Path A: Full v2 Schema + GPU Scan Compaction
 Summary
-- Simple loader + CPU-side filtering + basic Vulkan draw.
-- Data remains on CPU; GPU gets only the filtered subset each frame.
-
-Architecture
-- File loader parses frame headers and maps data into CPU memory.
-- UI filters produce a small set of rays.
-- GPU uploads filtered rays to a dynamic vertex buffer each frame.
-- Rendering uses line list + point sprites for samples.
-
+- Implement v2 schema with Section table + Attribute Streams.
+- Add GPU scan compaction for arbitrary filters (state, reason, ROI).
 Pros
-- Fast to implement.
-- Debug-friendly and easy to iterate.
-- Low complexity, minimal GPU code.
+- Maximum flexibility and long-term durability.
+Effort
+- High.
 
-Cons
-- Limited scalability with very large ray counts.
-- CPU filtering can become a bottleneck.
-
-Best For
-- Early bring-up, small-to-medium recorded datasets.
-
----------------------------------------------------------------------
-Solution B: GPU-First Replay (Balanced)
----------------------------------------------------------------------
+Path B: v1 + Sidecar Debug Packs (Low Risk)
 Summary
-- Load full ray data to GPU once; filter and sample on GPU via compute.
-- CPU handles timeline, UI, and small metadata tasks.
-
-Architecture
-- Loader reads frame data into host-visible staging buffers.
-- Per-frame ray buffers are uploaded to GPU storage buffers.
-- GPU compute pass performs filtering, sampling, and compaction.
-- Rendering draws from compacted GPU buffers (indirect draw).
-
+- Keep v1 core file; store extended debug data in sidecar files per frame.
+- Sidecar holds SampleRecordV2 + attributes with the same indexing.
 Pros
-- Scales to large datasets.
-- Stable performance regardless of ray count.
-- Clean separation of data and view.
+- Minimal disruption; easy to add/remove debug channels.
+Effort
+- Medium.
 
-Cons
-- More complex pipeline (compute + graphics).
-- Requires careful synchronization and GPU memory management.
-
-Best For
-- Medium-to-large datasets; sustained interactive playback.
-
----------------------------------------------------------------------
-Solution C: Full Debug Suite (Advanced)
----------------------------------------------------------------------
+Path C: Columnar v2 (SoA-First)
 Summary
-- Adds a modular data graph, plugins, and advanced visualizations.
-- Supports multi-view, overlays, and scripted analysis.
-
-Architecture
-- Plugin system for data sources and visualizations.
-- Internal node graph with cached stages (decode, filter, sample, render).
-- GPU-based rendering + compute; optional CPU fallback.
-- Scripting interface for custom debug queries.
-
+- Store rays/samples in columnar streams for faster GPU uploads.
+- Attribute streams become the primary storage.
 Pros
-- Very powerful and extensible.
-- Ideal for complex analysis workflows.
+- Best for very large datasets; GPU-friendly.
+Effort
+- Medium to High.
 
-Cons
-- Highest implementation cost.
-- Larger maintenance burden.
+Path D: Streaming Debug Timeline
+Summary
+- Add a ring-buffer writer in the training app and live stream into viewer.
+- Viewer persists to v2 file for later replay.
+Pros
+- Real-time debugging and postmortem replay.
+Effort
+- High.
 
-Best For
-- Long-term platform with multiple teams and evolving needs.
-
----------------------------------------------------------------------
-Recommendation (Best Modern Baseline)
----------------------------------------------------------------------
-Recommend Solution B as the baseline:
-- Modern Vulkan (storage buffers, compute, indirect draws).
-- High performance without excessive architectural overhead.
-- Keeps the tool elegant and focused while leaving room to grow.
-
-You can start with a minimal B1 subset:
-- GPU buffer upload per frame.
-- Compute filter + compact (prefix sum).
-- Single draw pass for rays.
-
-Then iterate toward B2:
-- Add sample visualization (points), heatmaps, and histogram overlays.
-- Add cached frame prefetch in a background thread.
+Path E: Deep Inspection UX
+Summary
+- Per-ray picking, sample lists, omit reasons, and contribution breakdowns.
+- Per-pixel aggregation and histograms.
+Pros
+- High diagnostic value; user-facing clarity.
+Effort
+- Medium.
 
 ---------------------------------------------------------------------
-Key UI Panels (All Solutions)
+Open Questions (Needed for v2)
 ---------------------------------------------------------------------
-- Timeline: play/pause/step, speed, frame index/time.
-- Camera: intrinsics, pose, frustum size, axis display.
-- Ray Filters: sample rate, pixel ROI, bounding volume, batch id.
-- Visual Style: line width, color modes, opacity, depth test.
-- Stats: ray count, filtered count, sample count, min/max/avg.
-
----------------------------------------------------------------------
-Open Questions
----------------------------------------------------------------------
-- Exact recording schema (what attributes are available)?
-- Do you need per-sample visualizations or just ray lines?
-- Maximum dataset sizes and desired playback rates?
-- Should the tool support multiple datasets at once?
+- Which omit reasons are required (occupancy, alpha, bounds, mip, etc.)?
+- Do you need to record all candidate samples or only kept + omitted reasons?
+- What are the maximum rays per frame and samples per ray?
+- Which per-sample attributes are essential vs optional?
 
 ---------------------------------------------------------------------
 Decision Checklist
 ---------------------------------------------------------------------
-- Choose Solution A, B, or C.
-- Confirm record format (binary + index vs. schema-based).
-- Confirm required visualizations (rays, samples, density, colors).
-- Confirm target dataset size and performance goals.
+- Choose a path (A-E) or a hybrid.
+- Confirm required debug attributes for rays and samples.
+- Confirm expected dataset size and performance targets.
