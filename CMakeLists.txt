@@ -89,6 +89,8 @@ target_sources(pngp-vis-rays
         pngp.vis.rays.cpp
         PUBLIC FILE_SET cxx_modules TYPE CXX_MODULES FILES
         pngp.vis.rays.ixx
+        pngp.vis.rays.record.ixx
+        pngp.vis.rays.playback.ixx
 )
 target_link_libraries(pngp-vis-rays PRIVATE vk-core::vk-core)
 add_dependencies(pngp-vis-rays compile-slang-shaders)
