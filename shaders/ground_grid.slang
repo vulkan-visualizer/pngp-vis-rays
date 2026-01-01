@@ -10,8 +10,8 @@ struct VSOutput {
 
 struct Push {
     column_major float4x4 mvp;
-    float4 params0;
-    float4 params1;
+    float4 grid;
+    float4 toggles;
 };
 
 [[vk::push_constant]]
@@ -29,15 +29,15 @@ VSOutput vertMain(VSInput input) {
 
 [shader("fragment")]
 float4 fragMain(VSOutput input) : SV_Target {
-    const float step = max(pc.params0.x, 0.0001);
-    const float major_step = max(pc.params0.y, step);
-    const float extent = max(pc.params0.z, step);
-    const float axis_length = max(pc.params0.w, 0.001);
+    const float step = max(pc.grid.x, 0.0001);
+    const float major_step = max(pc.grid.y, step);
+    const float extent = max(pc.grid.z, step);
+    const float axis_length = max(pc.grid.w, 0.001);
 
-    const float origin_scale = max(pc.params1.x, 0.001);
-    const float show_grid = pc.params1.y;
-    const float show_axes = pc.params1.z;
-    const float show_origin = pc.params1.w;
+    const float origin_scale = max(pc.toggles.x, 0.001);
+    const float show_grid = pc.toggles.y;
+    const float show_axes = pc.toggles.z;
+    const float show_origin = pc.toggles.w;
 
     const float2 p = float2(input.world.x, input.world.z);
     const float2 uv_minor = p / step;
@@ -49,9 +49,9 @@ float4 fragMain(VSOutput input) : SV_Target {
     float minor = 1.0 - min(min(minor_grid.x, minor_grid.y), 1.0);
     float major = 1.0 - min(min(major_grid.x, major_grid.y), 1.0);
 
-    const float fade = saturate(1.0 - length(p) / extent);
-    minor *= fade * show_grid;
-    major *= fade * show_grid;
+    if (max(abs(p.x), abs(p.y)) > extent) discard;
+    minor *= show_grid;
+    major *= show_grid;
 
     float axis_x = 1.0 - smoothstep(0.0, fwidth(p.y), abs(p.y));
     float axis_z = 1.0 - smoothstep(0.0, fwidth(p.x), abs(p.x));

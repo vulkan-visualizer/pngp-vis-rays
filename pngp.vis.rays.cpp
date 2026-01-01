@@ -58,22 +58,22 @@ namespace {
         s->scroll += float(yoff);
     }
 
-    struct GridPushConstants {
+    struct GridPush {
         vk::math::mat4 mvp{};
-        vk::math::vec4 params0{};
-        vk::math::vec4 params1{};
+        vk::math::vec4 grid{};
+        vk::math::vec4 toggles{};
     };
 
-    vk::memory::MeshCPU<vk::geometry::VertexP3C4> build_ground_plane(const GridSettings& grid) {
+    vk::memory::MeshCPU<vk::geometry::VertexP3C4> build_ground_plane(const float extent) {
         vk::memory::MeshCPU<vk::geometry::VertexP3C4> mesh{};
-        const float extent = std::max(0.1f, grid.grid_extent);
+        const float clamped_extent = std::max(0.1f, extent);
         const vk::math::vec4 color{1.0f, 1.0f, 1.0f, 1.0f};
 
         mesh.vertices = {
-            {{-extent, 0.0f, -extent, 0.0f}, color},
-            {{extent, 0.0f, -extent, 0.0f}, color},
-            {{extent, 0.0f, extent, 0.0f}, color},
-            {{-extent, 0.0f, extent, 0.0f}, color},
+            {{-clamped_extent, 0.0f, -clamped_extent, 0.0f}, color},
+            {{clamped_extent, 0.0f, -clamped_extent, 0.0f}, color},
+            {{clamped_extent, 0.0f, clamped_extent, 0.0f}, color},
+            {{-clamped_extent, 0.0f, clamped_extent, 0.0f}, color},
         };
 
         mesh.indices = {0, 1, 2, 0, 2, 3};
@@ -88,18 +88,37 @@ namespace {
                                        vkctx.graphics_queue, mesh);
     }
 
-    std::vector<std::byte> read_shader_bytes(const char* primary, const char* fallback) {
-        try {
-            return vk::pipeline::read_file_bytes(primary);
-        } catch (const std::exception&) {
-            return vk::pipeline::read_file_bytes(fallback);
+    std::vector<std::byte> read_shader_bytes(std::span<const char* const> paths) {
+        std::exception_ptr last_error;
+        for (const char* path : paths) {
+            try {
+                return vk::pipeline::read_file_bytes(path);
+            } catch (...) {
+                last_error = std::current_exception();
+            }
         }
+        if (last_error) std::rethrow_exception(last_error);
+        throw std::runtime_error("ground_grid.spv not found");
+    }
+
+    GridPush make_grid_push(const GridSettings& grid, const vk::math::mat4& mvp) {
+        const float step   = std::max(0.001f, grid.grid_step);
+        const float extent = std::max(0.1f, grid.grid_extent);
+        const float major  = static_cast<float>(std::max(1, grid.major_every));
+
+        GridPush push{};
+        push.mvp     = mvp;
+        push.grid    = {step, step * major, extent, std::max(0.001f, grid.axis_length)};
+        push.toggles = {std::max(0.001f, grid.origin_scale), grid.show_grid ? 1.0f : 0.0f,
+                        grid.show_axes ? 1.0f : 0.0f, grid.show_origin ? 1.0f : 0.0f};
+        return push;
     }
 
     vk::pipeline::GraphicsPipeline create_grid_pipeline(const vk::context::VulkanContext& vkctx,
                                                         const vk::swapchain::Swapchain& sc) {
         const auto vin = vk::pipeline::make_vertex_input<vk::geometry::VertexP3C4>();
-        const auto spv = read_shader_bytes("shaders/ground_grid.spv", "../shaders/ground_grid.spv");
+        const std::array paths{"shaders/ground_grid.spv", "../shaders/ground_grid.spv"};
+        const auto spv = read_shader_bytes(paths);
         auto shader    = vk::pipeline::load_shader_module(vkctx.device, spv);
 
         vk::pipeline::GraphicsPipelineDesc desc{};
@@ -111,7 +130,7 @@ namespace {
         desc.polygon_mode         = vk::PolygonMode::eFill;
         desc.topology             = vk::PrimitiveTopology::eTriangleList;
         desc.enable_blend         = true;
-        desc.push_constant_bytes  = sizeof(GridPushConstants);
+        desc.push_constant_bytes  = sizeof(GridPush);
         desc.push_constant_stages = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
         return vk::pipeline::create_graphics_pipeline(vkctx.device, vin, desc, shader, "vertMain",
                                                       "fragMain");
@@ -151,7 +170,7 @@ void pngp::vis::rays::RaysInspector::run() {
         const bool rebuild_mesh = imgui_panel();
         if (rebuild_mesh) {
             ctx.device.waitIdle();
-            const auto mesh_cpu = build_ground_plane(grid);
+            const auto mesh_cpu = build_ground_plane(grid.grid_extent);
             grid_mesh = upload_mesh_safe(ctx, mesh_cpu);
         }
 
@@ -233,7 +252,7 @@ pngp::vis::rays::RaysInspector::RaysInspector(const RaysInspectorInfo& info) {
         cam.set_state(st);
     }
 
-    const auto mesh_cpu = build_ground_plane(grid);
+    const auto mesh_cpu = build_ground_plane(grid.grid_extent);
     grid_mesh = upload_mesh_safe(ctx, mesh_cpu);
     grid_pipeline = create_grid_pipeline(ctx, swapchain);
 }
@@ -326,21 +345,13 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
 
     cmd.setViewport(0, {vp});
     cmd.setScissor(0, {scissor});
-    if (grid_mesh.index_count > 0) {
+    const bool grid_visible = grid.show_grid || grid.show_axes || grid.show_origin;
+    if (grid_mesh.index_count > 0 && grid_visible) {
         cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *grid_pipeline.pipeline);
-        const float step        = std::max(0.001f, grid.grid_step);
-        const float extent      = std::max(0.1f, grid.grid_extent);
-        const float major_every = static_cast<float>(std::max(1, grid.major_every));
-
-        GridPushConstants push{};
-        push.mvp     = grid_mvp;
-        push.params0 = {step, step * major_every, extent, std::max(0.001f, grid.axis_length)};
-        push.params1 = {std::max(0.001f, grid.origin_scale), grid.show_grid ? 1.0f : 0.0f,
-                        grid.show_axes ? 1.0f : 0.0f, grid.show_origin ? 1.0f : 0.0f};
-
+        const GridPush push = make_grid_push(grid, grid_mvp);
         cmd.pushConstants(*grid_pipeline.layout,
                           vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-                          vk::ArrayProxy<const GridPushConstants>{push});
+                          vk::ArrayProxy<const GridPush>{push});
 
         vk::DeviceSize offset = 0;
         cmd.bindVertexBuffers(0, {*grid_mesh.vertex_buffer.buffer}, {offset});
@@ -378,15 +389,15 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
     bool rebuild = false;
     ImGui::Begin("Rays Inspector");
     ImGui::TextUnformatted("Ground Plane");
-    rebuild |= ImGui::Checkbox("Show grid", &grid.show_grid);
-    rebuild |= ImGui::Checkbox("Show axes", &grid.show_axes);
-    rebuild |= ImGui::Checkbox("Show origin", &grid.show_origin);
+    ImGui::Checkbox("Show grid", &grid.show_grid);
+    ImGui::Checkbox("Show axes", &grid.show_axes);
+    ImGui::Checkbox("Show origin", &grid.show_origin);
     ImGui::Separator();
     rebuild |= ImGui::SliderFloat("Grid extent", &grid.grid_extent, 2.0f, 100.0f);
-    rebuild |= ImGui::SliderFloat("Grid step", &grid.grid_step, 0.1f, 5.0f);
-    rebuild |= ImGui::SliderInt("Major every", &grid.major_every, 1, 20);
-    rebuild |= ImGui::SliderFloat("Axis length", &grid.axis_length, 0.5f, 20.0f);
-    rebuild |= ImGui::SliderFloat("Origin scale", &grid.origin_scale, 0.05f, 2.0f);
+    ImGui::SliderFloat("Grid step", &grid.grid_step, 0.1f, 5.0f);
+    ImGui::SliderInt("Major every", &grid.major_every, 1, 20);
+    ImGui::SliderFloat("Axis length", &grid.axis_length, 0.5f, 20.0f);
+    ImGui::SliderFloat("Origin scale", &grid.origin_scale, 0.05f, 2.0f);
     ImGui::Separator();
     ImGui::Checkbox("Fly mode", &grid.fly_mode);
     ImGui::TextUnformatted("Orbit: Alt/Space + LMB rotate, MMB pan, wheel zoom");
