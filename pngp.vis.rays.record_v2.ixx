@@ -195,6 +195,15 @@ namespace pngp::vis::rays::record_v2 {
         std::array<std::uint64_t, 2> reserved1{};
     };
 
+    // ========================================================================
+    // Attribute stream view (CPU).
+    // ========================================================================
+    export struct AttributeStreamViewV2 {
+        AttributeStreamDesc desc{};
+        std::string_view name{};
+        std::span<const std::byte> data{};
+    };
+
     static_assert(std::is_standard_layout_v<RecordHeaderV2>);
     static_assert(std::is_standard_layout_v<FrameIndexEntryV2>);
     static_assert(std::is_standard_layout_v<SectionTableEntryV2>);
@@ -203,6 +212,7 @@ namespace pngp::vis::rays::record_v2 {
     static_assert(std::is_standard_layout_v<SampleEvalV2>);
     static_assert(std::is_standard_layout_v<RayResultV2>);
     static_assert(std::is_standard_layout_v<AttributeStreamDesc>);
+    static_assert(std::is_standard_layout_v<AttributeStreamViewV2>);
 
     // ========================================================================
     // Frame view for the current frame (CPU).
@@ -213,6 +223,7 @@ namespace pngp::vis::rays::record_v2 {
         std::span<const SampleRecordV2> samples{};
         std::span<const SampleEvalV2> evals{};
         std::span<const RayResultV2> results{};
+        std::span<const AttributeStreamViewV2> attributes{};
     };
 
     // ========================================================================
@@ -261,6 +272,9 @@ namespace pngp::vis::rays::record_v2 {
             scratch_samples_.clear();
             scratch_evals_.clear();
             scratch_results_.clear();
+            scratch_attribute_blob_.clear();
+            scratch_attribute_descs_.clear();
+            scratch_attribute_views_.clear();
         }
 
         [[nodiscard]] bool is_open() const noexcept { return file_.is_open(); }
@@ -282,6 +296,7 @@ namespace pngp::vis::rays::record_v2 {
             read_section_(sections, SectionType::SampleRecord, scratch_samples_);
             read_section_(sections, SectionType::SampleEval, scratch_evals_);
             read_section_(sections, SectionType::RayResult, scratch_results_);
+            read_attribute_section_(sections);
 
             return FrameViewV2{
                 frame,
@@ -289,6 +304,7 @@ namespace pngp::vis::rays::record_v2 {
                 scratch_samples_,
                 scratch_evals_,
                 scratch_results_,
+                scratch_attribute_views_,
             };
         }
 
@@ -308,6 +324,13 @@ namespace pngp::vis::rays::record_v2 {
             file_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
             file_.read(reinterpret_cast<char*>(dst.data()), static_cast<std::streamsize>(dst.size_bytes()));
             if (!file_) throw std::runtime_error("RecordReaderV2: read failed");
+        }
+
+        [[nodiscard]] std::string_view string_view_from_offset_(std::uint32_t offset) const {
+            if (strings_.empty() || offset >= strings_.size()) return {};
+            const auto begin = strings_.data() + offset;
+            const auto end = std::find(begin, strings_.data() + strings_.size(), '\0');
+            return std::string_view{begin, static_cast<std::size_t>(end - begin)};
         }
 
         void validate_header_() const {
@@ -367,6 +390,53 @@ namespace pngp::vis::rays::record_v2 {
             read_bytes_(it->offset, std::as_writable_bytes(std::span{out}));
         }
 
+        void read_attribute_section_(std::span<const SectionTableEntryV2> sections) {
+            scratch_attribute_views_.clear();
+            scratch_attribute_descs_.clear();
+            scratch_attribute_blob_.clear();
+
+            const auto it = std::find_if(sections.begin(), sections.end(),
+                                         [&](const SectionTableEntryV2& s) {
+                                             return s.type == static_cast<std::uint32_t>(SectionType::AttributeStream);
+                                         });
+            if (it == sections.end() || it->count == 0 || it->size_bytes == 0) return;
+            if (it->stride_bytes != sizeof(AttributeStreamDesc)) {
+                throw std::runtime_error("RecordReaderV2: attribute stream stride mismatch");
+            }
+
+            scratch_attribute_blob_.resize(static_cast<std::size_t>(it->size_bytes));
+            read_bytes_(it->offset, std::span{scratch_attribute_blob_});
+
+            const std::size_t desc_count = static_cast<std::size_t>(it->count);
+            const std::size_t desc_bytes = desc_count * sizeof(AttributeStreamDesc);
+            if (desc_bytes > scratch_attribute_blob_.size()) {
+                throw std::runtime_error("RecordReaderV2: attribute section too small");
+            }
+
+            scratch_attribute_descs_.resize(desc_count);
+            std::memcpy(scratch_attribute_descs_.data(), scratch_attribute_blob_.data(), desc_bytes);
+
+            scratch_attribute_views_.reserve(desc_count);
+            for (const auto& desc : scratch_attribute_descs_) {
+                const auto offset = static_cast<std::size_t>(desc.data_offset);
+                const auto bytes = static_cast<std::size_t>(desc.data_bytes);
+                if (offset > scratch_attribute_blob_.size() ||
+                    bytes > scratch_attribute_blob_.size() - offset) {
+                    throw std::runtime_error("RecordReaderV2: attribute stream data out of range");
+                }
+
+                auto data = std::span<const std::byte>{
+                    scratch_attribute_blob_.data() + offset,
+                    bytes,
+                };
+                scratch_attribute_views_.push_back(AttributeStreamViewV2{
+                    desc,
+                    string_view_from_offset_(desc.name_offset),
+                    data,
+                });
+            }
+        }
+
         std::string path_{};
         mutable std::ifstream file_{};
         std::uint64_t file_size_{};
@@ -378,6 +448,9 @@ namespace pngp::vis::rays::record_v2 {
         std::vector<SampleRecordV2> scratch_samples_{};
         std::vector<SampleEvalV2> scratch_evals_{};
         std::vector<RayResultV2> scratch_results_{};
+        std::vector<std::byte> scratch_attribute_blob_{};
+        std::vector<AttributeStreamDesc> scratch_attribute_descs_{};
+        std::vector<AttributeStreamViewV2> scratch_attribute_views_{};
     };
 
     // ========================================================================

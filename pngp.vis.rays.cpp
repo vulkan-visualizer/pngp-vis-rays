@@ -25,6 +25,11 @@ namespace {
     using pngp::vis::rays::InputState;
     using pngp::vis::rays::RaySettings;
 
+    constexpr std::uint32_t k_filter_roi       = 1u << 0;
+    constexpr std::uint32_t k_filter_sample    = 1u << 1;
+    constexpr std::uint32_t k_filter_mask_id   = 1u << 2;
+    constexpr std::uint32_t k_filter_batch_id  = 1u << 3;
+
     // =========================================================================
     // GLFW input callbacks: collect raw input into InputState.
     // =========================================================================
@@ -130,6 +135,29 @@ namespace {
         }
         if (last_error) std::rethrow_exception(last_error);
         throw std::runtime_error("ground_grid.spv not found");
+    }
+
+    // =========================================================================
+    // Attribute stream lookup helpers.
+    // =========================================================================
+    int find_attribute_index(
+        std::span<const pngp::vis::rays::record_v2::AttributeStreamViewV2> attrs,
+        std::string_view name) {
+        for (std::size_t i = 0; i < attrs.size(); ++i) {
+            const auto& attr = attrs[i];
+            if (attr.name != name) continue;
+            if (attr.desc.target !=
+                static_cast<std::uint32_t>(pngp::vis::rays::record_v2::AttributeTarget::Ray)) {
+                continue;
+            }
+            if (attr.desc.format !=
+                static_cast<std::uint32_t>(pngp::vis::rays::record_v2::AttributeFormat::U32)) {
+                continue;
+            }
+            if (attr.desc.components != 1) continue;
+            return static_cast<int>(i);
+        }
+        return -1;
     }
 
     // =========================================================================
@@ -239,6 +267,136 @@ namespace {
             .pBufferInfo     = &info,
         };
         device.updateDescriptorSets({write}, {});
+    }
+
+    // =========================================================================
+    // Upload helpers for v2 payloads.
+    // =========================================================================
+    vk::memory::Buffer upload_storage_buffer(const vk::context::VulkanContext& vkctx,
+                                             std::span<const std::byte> bytes) {
+        if (bytes.empty()) return {};
+        return vk::memory::upload_to_device_local_buffer(
+            vkctx.physical_device, vkctx.device, vkctx.command_pool, vkctx.graphics_queue, bytes,
+            vk::BufferUsageFlagBits::eStorageBuffer);
+    }
+
+    vk::memory::Buffer upload_storage_buffer_non_empty(const vk::context::VulkanContext& vkctx,
+                                                       std::span<const std::byte> bytes) {
+        if (!bytes.empty()) return upload_storage_buffer(vkctx, bytes);
+
+        std::array<std::byte, 16> zeros{};
+        return vk::memory::upload_to_device_local_buffer(
+            vkctx.physical_device, vkctx.device, vkctx.command_pool, vkctx.graphics_queue, zeros,
+            vk::BufferUsageFlagBits::eStorageBuffer);
+    }
+
+    // =========================================================================
+    // Attribute stream descriptor helpers (v2 GPU uploads).
+    // =========================================================================
+    vk::raii::DescriptorSetLayout create_attribute_set_layout(const vk::raii::Device& device) {
+        const vk::DescriptorSetLayoutBinding binding{
+            .binding         = 0,
+            .descriptorType  = vk::DescriptorType::eStorageBuffer,
+            .descriptorCount = 1,
+            .stageFlags      = vk::ShaderStageFlagBits::eAll,
+        };
+
+        const vk::DescriptorSetLayoutCreateInfo ci{
+            .bindingCount = 1,
+            .pBindings    = &binding,
+        };
+        return vk::raii::DescriptorSetLayout{device, ci};
+    }
+
+    vk::raii::DescriptorPool create_attribute_pool(const vk::raii::Device& device,
+                                                   const std::uint32_t count) {
+        if (count == 0) return vk::raii::DescriptorPool{nullptr};
+
+        const vk::DescriptorPoolSize pool_size{
+            .type            = vk::DescriptorType::eStorageBuffer,
+            .descriptorCount = count,
+        };
+        const vk::DescriptorPoolCreateInfo ci{
+            .flags         = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+            .maxSets       = count,
+            .poolSizeCount = 1,
+            .pPoolSizes    = &pool_size,
+        };
+        return vk::raii::DescriptorPool{device, ci};
+    }
+
+    std::vector<vk::raii::DescriptorSet> allocate_attribute_sets(
+        const vk::raii::Device& device,
+        const vk::raii::DescriptorPool& pool,
+        const vk::raii::DescriptorSetLayout& layout,
+        const std::uint32_t count) {
+        if (count == 0) return {};
+
+        std::vector<vk::DescriptorSetLayout> layouts(count, *layout);
+        const vk::DescriptorSetAllocateInfo ai{
+            .descriptorPool     = *pool,
+            .descriptorSetCount = count,
+            .pSetLayouts        = layouts.data(),
+        };
+
+        auto sets = vk::raii::DescriptorSets{device, ai};
+        std::vector<vk::raii::DescriptorSet> out{};
+        out.reserve(count);
+        for (auto& set : sets) {
+            out.emplace_back(std::move(set));
+        }
+        return out;
+    }
+
+    void update_attribute_sets(const vk::raii::Device& device,
+                               std::span<const vk::raii::DescriptorSet> sets,
+                               std::span<const vk::memory::Buffer> buffers) {
+        if (sets.empty() || buffers.empty()) return;
+
+        const std::size_t count = std::min(sets.size(), buffers.size());
+        std::vector<vk::DescriptorBufferInfo> infos{};
+        std::vector<vk::WriteDescriptorSet> writes{};
+        infos.reserve(count);
+        writes.reserve(count);
+
+        for (std::size_t i = 0; i < count; ++i) {
+            infos.push_back(vk::DescriptorBufferInfo{*buffers[i].buffer, 0, buffers[i].size});
+            writes.push_back(vk::WriteDescriptorSet{
+                .dstSet          = *sets[i],
+                .dstBinding      = 0,
+                .descriptorCount = 1,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .pBufferInfo     = &infos.back(),
+            });
+        }
+
+        device.updateDescriptorSets(writes, {});
+    }
+
+    void ensure_attribute_sets(const vk::raii::Device& device,
+                               const vk::raii::DescriptorSetLayout& layout,
+                               const std::uint32_t desired,
+                               vk::raii::DescriptorPool& pool,
+                               std::vector<vk::raii::DescriptorSet>& sets,
+                               std::uint32_t& capacity) {
+        if (desired == 0) {
+            sets.clear();
+            pool = vk::raii::DescriptorPool{nullptr};
+            capacity = 0;
+            return;
+        }
+
+        if (desired > capacity) {
+            sets.clear();
+            pool = create_attribute_pool(device, desired);
+            sets = allocate_attribute_sets(device, pool, layout, desired);
+            capacity = desired;
+        } else if (sets.size() < desired) {
+            sets.clear();
+            pool = create_attribute_pool(device, desired);
+            sets = allocate_attribute_sets(device, pool, layout, desired);
+            capacity = desired;
+        }
     }
 
     vk::pipeline::GraphicsPipeline create_ray_pipeline_with_paths(const vk::context::VulkanContext& vkctx,
@@ -389,11 +547,21 @@ void pngp::vis::rays::RaysInspector::run() {
             record_v2_active = false;
             v2_view = {};
             active_frame_v2 = {};
+            v2_mask_attr_index = -1;
+            v2_batch_attr_index = -1;
             ray_input     = {};
             ray_filtered  = {};
             ray_count     = {};
             ray_indirect  = {};
             ray_capacity  = 0;
+            v2_samples    = {};
+            v2_evals      = {};
+            v2_results    = {};
+            v2_attribute_buffers.clear();
+            v2_attribute_sets.clear();
+            v2_attribute_pool = vk::raii::DescriptorPool{nullptr};
+            v2_attribute_capacity = 0;
+            rays.roi_initialized = false;
             active_frame  = {};
             record_error.clear();
         }
@@ -412,13 +580,24 @@ void pngp::vis::rays::RaysInspector::run() {
                     if (record_v2::is_v2_file(record_path_buf.data())) {
                         record_v2_reader.open(record_path_buf.data());
                         record_v2_active = true;
+                        v2_mask_attr_index = -1;
+                        v2_batch_attr_index = -1;
                         ray_input     = {};
                         ray_filtered  = {};
                         ray_count     = {};
                         ray_indirect  = {};
                         ray_capacity  = 0;
+                        v2_samples    = {};
+                        v2_evals      = {};
+                        v2_results    = {};
+                        v2_attribute_buffers.clear();
+                        v2_attribute_sets.clear();
+                        v2_attribute_pool = vk::raii::DescriptorPool{nullptr};
+                        v2_attribute_capacity = 0;
+                        rays.roi_initialized = false;
                     } else {
                         playback.open(record_path_buf.data());
+                        rays.roi_initialized = false;
                     }
 
                     active_frame_index = 0;
@@ -440,9 +619,15 @@ void pngp::vis::rays::RaysInspector::run() {
                 active_frame_v2 = v2_view.header;
                 v2_ray_index = 0;
                 v2_sample_index = 0;
+                v2_mask_attr_index = find_attribute_index(v2_view.attributes, "mask_id");
+                v2_batch_attr_index = find_attribute_index(v2_view.attributes, "batch_id");
 
                 ctx.device.waitIdle();
                 ray_input = {};
+                v2_samples = {};
+                v2_evals = {};
+                v2_results = {};
+                v2_attribute_buffers.clear();
                 if (!v2_view.rays.empty()) {
                     const auto bytes = std::as_bytes(v2_view.rays);
                     auto buffer = vk::memory::upload_to_device_local_buffer(
@@ -451,13 +636,38 @@ void pngp::vis::rays::RaysInspector::run() {
                     ray_input = playback::RayBufferGPU{std::move(buffer), static_cast<std::uint64_t>(v2_view.rays.size())};
                 }
 
+                v2_samples = upload_storage_buffer(ctx, std::as_bytes(v2_view.samples));
+                v2_evals = upload_storage_buffer(ctx, std::as_bytes(v2_view.evals));
+                v2_results = upload_storage_buffer(ctx, std::as_bytes(v2_view.results));
+
+                const auto attr_count = static_cast<std::uint32_t>(v2_view.attributes.size());
+                ensure_attribute_sets(ctx.device, v2_attribute_set_layout, attr_count,
+                                      v2_attribute_pool, v2_attribute_sets, v2_attribute_capacity);
+                if (attr_count > 0) {
+                    v2_attribute_buffers.reserve(attr_count);
+                    for (const auto& attr : v2_view.attributes) {
+                        v2_attribute_buffers.push_back(upload_storage_buffer_non_empty(ctx, attr.data));
+                    }
+                    update_attribute_sets(ctx.device, v2_attribute_sets, v2_attribute_buffers);
+                }
+
                 const auto in_count_u64 = std::min<std::uint64_t>(ray_input.count, std::numeric_limits<std::uint32_t>::max());
                 const auto in_count = static_cast<std::uint32_t>(in_count_u64);
                 if (in_count > 0) {
                     const std::uint32_t desired = std::min(rays.max_rays, in_count);
                     ensure_ray_buffers(ctx, desired, sizeof(record_v2::RayBaseRecordV2),
                                        ray_filtered, ray_count, ray_indirect, ray_capacity);
-                    filter::update_filter_set(ctx.device, filter_bindings, ray_input.buffer, ray_filtered, ray_count);
+                    const auto& sample_buf = v2_samples.size > 0 ? v2_samples : dummy_storage;
+                    const auto& mask_buf =
+                        (v2_mask_attr_index >= 0 && static_cast<std::size_t>(v2_mask_attr_index) < v2_attribute_buffers.size())
+                            ? v2_attribute_buffers[static_cast<std::size_t>(v2_mask_attr_index)]
+                            : dummy_storage;
+                    const auto& batch_buf =
+                        (v2_batch_attr_index >= 0 && static_cast<std::size_t>(v2_batch_attr_index) < v2_attribute_buffers.size())
+                            ? v2_attribute_buffers[static_cast<std::size_t>(v2_batch_attr_index)]
+                            : dummy_storage;
+                    filter::update_filter_set(ctx.device, filter_bindings, ray_input.buffer, ray_filtered, ray_count,
+                                              sample_buf, mask_buf, batch_buf);
                     update_ray_set(ctx.device, ray_set, ray_filtered);
                     filter::update_indirect_set(ctx.device, indirect_bindings, ray_count, ray_indirect);
                     filter_dirty = true;
@@ -474,7 +684,8 @@ void pngp::vis::rays::RaysInspector::run() {
                     const std::uint32_t desired = std::min(rays.max_rays, in_count);
                     ensure_ray_buffers(ctx, desired, sizeof(record::RayRecord),
                                        ray_filtered, ray_count, ray_indirect, ray_capacity);
-                    filter::update_filter_set(ctx.device, filter_bindings, ray_input.buffer, ray_filtered, ray_count);
+                    filter::update_filter_set(ctx.device, filter_bindings, ray_input.buffer, ray_filtered, ray_count,
+                                              dummy_storage, dummy_storage, dummy_storage);
                     update_ray_set(ctx.device, ray_set, ray_filtered);
                     filter::update_indirect_set(ctx.device, indirect_bindings, ray_count, ray_indirect);
                     filter_dirty = true;
@@ -495,7 +706,19 @@ void pngp::vis::rays::RaysInspector::run() {
                                                           : sizeof(record::RayRecord);
                     ensure_ray_buffers(ctx, desired, element_bytes,
                                        ray_filtered, ray_count, ray_indirect, ray_capacity);
-                    filter::update_filter_set(ctx.device, filter_bindings, ray_input.buffer, ray_filtered, ray_count);
+                    const auto& sample_buf = record_v2_active && v2_samples.size > 0 ? v2_samples : dummy_storage;
+                    const auto& mask_buf =
+                        (record_v2_active && v2_mask_attr_index >= 0 &&
+                         static_cast<std::size_t>(v2_mask_attr_index) < v2_attribute_buffers.size())
+                            ? v2_attribute_buffers[static_cast<std::size_t>(v2_mask_attr_index)]
+                            : dummy_storage;
+                    const auto& batch_buf =
+                        (record_v2_active && v2_batch_attr_index >= 0 &&
+                         static_cast<std::size_t>(v2_batch_attr_index) < v2_attribute_buffers.size())
+                            ? v2_attribute_buffers[static_cast<std::size_t>(v2_batch_attr_index)]
+                            : dummy_storage;
+                    filter::update_filter_set(ctx.device, filter_bindings, ray_input.buffer, ray_filtered, ray_count,
+                                              sample_buf, mask_buf, batch_buf);
                     update_ray_set(ctx.device, ray_set, ray_filtered);
                     filter::update_indirect_set(ctx.device, indirect_bindings, ray_count, ray_indirect);
                     filter_dirty = true;
@@ -631,6 +854,11 @@ pngp::vis::rays::RaysInspector::RaysInspector(const RaysInspectorInfo& info) {
     ray_set          = allocate_ray_set(ctx.device, ray_pool, ray_set_layout);
     ray_pipeline     = create_ray_pipeline(ctx, swapchain, ray_set_layout);
     ray_pipeline_v2  = create_ray_pipeline_v2(ctx, swapchain, ray_set_layout);
+    v2_attribute_set_layout = create_attribute_set_layout(ctx.device);
+    {
+        std::array<std::byte, 16> zeros{};
+        dummy_storage = upload_storage_buffer_non_empty(ctx, zeros);
+    }
 
     filter_pipeline  = filter::create_filter_pipeline(ctx.device, swapchain.format);
     {
@@ -734,6 +962,43 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
         params.in_count = in_count;
         params.stride   = ray_stride;
         params.max_out  = ray_max_out;
+        params.flags    = 0;
+        params.sample_state_mask = 0;
+        params.omit_reason_mask  = 0;
+        params.mask_id  = rays.mask_id;
+        params.batch_id = rays.batch_id;
+
+        const std::uint32_t frame_width =
+            record_v2_active ? active_frame_v2.width : active_frame.width;
+        const std::uint32_t frame_height =
+            record_v2_active ? active_frame_v2.height : active_frame.height;
+        const int max_x = frame_width > 0 ? static_cast<int>(frame_width - 1) : 0;
+        const int max_y = frame_height > 0 ? static_cast<int>(frame_height - 1) : 0;
+        int roi_min_x = std::clamp(rays.roi_min_x, 0, max_x);
+        int roi_min_y = std::clamp(rays.roi_min_y, 0, max_y);
+        int roi_max_x = std::clamp(rays.roi_max_x, 0, max_x);
+        int roi_max_y = std::clamp(rays.roi_max_y, 0, max_y);
+        if (roi_min_x > roi_max_x) std::swap(roi_min_x, roi_max_x);
+        if (roi_min_y > roi_max_y) std::swap(roi_min_y, roi_max_y);
+        params.roi_min_x = static_cast<std::uint32_t>(roi_min_x);
+        params.roi_min_y = static_cast<std::uint32_t>(roi_min_y);
+        params.roi_max_x = static_cast<std::uint32_t>(roi_max_x);
+        params.roi_max_y = static_cast<std::uint32_t>(roi_max_y);
+
+        if (rays.roi_enabled && frame_width > 0 && frame_height > 0) {
+            params.flags |= k_filter_roi;
+        }
+        if (record_v2_active && (rays.filter_sample_state || rays.filter_omit_reason) && v2_samples.size > 0) {
+            params.flags |= k_filter_sample;
+            params.sample_state_mask = rays.filter_sample_state ? rays.sample_state_mask : 0u;
+            params.omit_reason_mask  = rays.filter_omit_reason ? rays.omit_reason_mask : 0u;
+        }
+        if (record_v2_active && rays.filter_mask_id && v2_mask_attr_index >= 0) {
+            params.flags |= k_filter_mask_id;
+        }
+        if (record_v2_active && rays.filter_batch_id && v2_batch_attr_index >= 0) {
+            params.flags |= k_filter_batch_id;
+        }
         const std::uint32_t group_count = (in_count + 255u) / 256u;
         filter::dispatch_filter(cmd, filter_pipe, filter_bindings, params, group_count);
 
@@ -1013,6 +1278,130 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
             filter_dirty = true;
         }
     }
+
+    const bool have_frame = (record_v2_active && record_v2_reader.is_open())
+                                ? (active_frame_v2.width > 0 && active_frame_v2.height > 0)
+                                : (playback.is_open() && active_frame.width > 0 && active_frame.height > 0);
+    const int max_x = have_frame
+                          ? static_cast<int>((record_v2_active ? active_frame_v2.width : active_frame.width) - 1)
+                          : 0;
+    const int max_y = have_frame
+                          ? static_cast<int>((record_v2_active ? active_frame_v2.height : active_frame.height) - 1)
+                          : 0;
+
+    if (!rays.roi_initialized && have_frame) {
+        rays.roi_min_x = 0;
+        rays.roi_min_y = 0;
+        rays.roi_max_x = max_x;
+        rays.roi_max_y = max_y;
+        rays.roi_initialized = true;
+    }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Advanced Filters");
+    if (ImGui::Checkbox("Enable ROI", &rays.roi_enabled)) {
+        filter_dirty = true;
+    }
+    if (rays.roi_enabled) {
+        int roi_min[2] = {rays.roi_min_x, rays.roi_min_y};
+        int roi_max[2] = {rays.roi_max_x, rays.roi_max_y};
+        if (ImGui::InputInt2("ROI min", roi_min)) {
+            rays.roi_min_x = std::clamp(roi_min[0], 0, max_x);
+            rays.roi_min_y = std::clamp(roi_min[1], 0, max_y);
+            filter_dirty = true;
+        }
+        if (ImGui::InputInt2("ROI max", roi_max)) {
+            rays.roi_max_x = std::clamp(roi_max[0], 0, max_x);
+            rays.roi_max_y = std::clamp(roi_max[1], 0, max_y);
+            filter_dirty = true;
+        }
+    }
+
+    const bool v2_sample_available =
+        record_v2_active && record_v2_reader.is_open() && !v2_view.samples.empty();
+    ImGui::BeginDisabled(!v2_sample_available);
+    if (ImGui::Checkbox("Filter sample state", &rays.filter_sample_state)) {
+        filter_dirty = true;
+    }
+    if (rays.filter_sample_state) {
+        std::uint32_t mask = rays.sample_state_mask;
+        bool candidate = (mask & (1u << 0)) != 0;
+        bool kept      = (mask & (1u << 1)) != 0;
+        bool omitted   = (mask & (1u << 2)) != 0;
+        bool term      = (mask & (1u << 3)) != 0;
+        if (ImGui::Checkbox("State: candidate", &candidate)) {
+            mask = candidate ? (mask | (1u << 0)) : (mask & ~(1u << 0));
+            filter_dirty = true;
+        }
+        if (ImGui::Checkbox("State: kept", &kept)) {
+            mask = kept ? (mask | (1u << 1)) : (mask & ~(1u << 1));
+            filter_dirty = true;
+        }
+        if (ImGui::Checkbox("State: omitted", &omitted)) {
+            mask = omitted ? (mask | (1u << 2)) : (mask & ~(1u << 2));
+            filter_dirty = true;
+        }
+        if (ImGui::Checkbox("State: terminated", &term)) {
+            mask = term ? (mask | (1u << 3)) : (mask & ~(1u << 3));
+            filter_dirty = true;
+        }
+        rays.sample_state_mask = mask;
+    }
+
+    if (ImGui::Checkbox("Filter omit reason", &rays.filter_omit_reason)) {
+        filter_dirty = true;
+    }
+    if (rays.filter_omit_reason) {
+        std::uint32_t mask = rays.omit_reason_mask;
+        const char* labels[] = {
+            "Omit: none",
+            "Omit: occupancy",
+            "Omit: alpha",
+            "Omit: bounds",
+            "Omit: step limit",
+            "Omit: density thresh",
+            "Omit: user mask",
+            "Omit: other",
+        };
+        for (std::uint32_t i = 0; i < 8; ++i) {
+            bool on = (mask & (1u << i)) != 0;
+            if (ImGui::Checkbox(labels[i], &on)) {
+                mask = on ? (mask | (1u << i)) : (mask & ~(1u << i));
+                filter_dirty = true;
+            }
+        }
+        rays.omit_reason_mask = mask;
+    }
+    ImGui::EndDisabled();
+
+    const bool has_mask_attr = record_v2_active && v2_mask_attr_index >= 0;
+    const bool has_batch_attr = record_v2_active && v2_batch_attr_index >= 0;
+    ImGui::BeginDisabled(!has_mask_attr);
+    if (ImGui::Checkbox("Filter mask id", &rays.filter_mask_id)) {
+        filter_dirty = true;
+    }
+    if (rays.filter_mask_id) {
+        int value = static_cast<int>(rays.mask_id);
+        if (ImGui::InputInt("Mask id", &value)) {
+            rays.mask_id = static_cast<std::uint32_t>(std::max(0, value));
+            filter_dirty = true;
+        }
+    }
+    ImGui::EndDisabled();
+
+    ImGui::BeginDisabled(!has_batch_attr);
+    if (ImGui::Checkbox("Filter batch id", &rays.filter_batch_id)) {
+        filter_dirty = true;
+    }
+    if (rays.filter_batch_id) {
+        int value = static_cast<int>(rays.batch_id);
+        if (ImGui::InputInt("Batch id", &value)) {
+            rays.batch_id = static_cast<std::uint32_t>(std::max(0, value));
+            filter_dirty = true;
+        }
+    }
+    ImGui::EndDisabled();
+
     ImGui::End();
     return rebuild;
 }

@@ -77,6 +77,23 @@ namespace pngp::vis::rays {
         float opacity     = 0.7f;
         std::uint32_t stride   = 1;
         std::uint32_t max_rays = 250000;
+
+        bool roi_enabled = false;
+        bool roi_initialized = false;
+        int roi_min_x = 0;
+        int roi_min_y = 0;
+        int roi_max_x = 0;
+        int roi_max_y = 0;
+
+        bool filter_sample_state = false;
+        bool filter_omit_reason  = false;
+        std::uint32_t sample_state_mask = 0x0Fu;
+        std::uint32_t omit_reason_mask  = 0xFFu;
+
+        bool filter_mask_id  = false;
+        bool filter_batch_id = false;
+        std::uint32_t mask_id  = 0;
+        std::uint32_t batch_id = 0;
     };
 
     export struct RaysInspectorInfo {
@@ -141,12 +158,21 @@ namespace pngp::vis::rays {
         bool record_v2_active = false;
         int v2_ray_index = 0;
         int v2_sample_index = 0;
+        int v2_mask_attr_index = -1;
+        int v2_batch_attr_index = -1;
 
         playback::RayBufferGPU ray_input{};
         vk::memory::Buffer ray_filtered{};
         vk::memory::Buffer ray_count{};
         vk::memory::Buffer ray_indirect{};
         std::uint32_t ray_capacity = 0;
+
+        vk::memory::Buffer v2_samples{};
+        vk::memory::Buffer v2_evals{};
+        vk::memory::Buffer v2_results{};
+        vk::memory::Buffer dummy_storage{};
+        std::vector<vk::memory::Buffer> v2_attribute_buffers{};
+        std::uint32_t v2_attribute_capacity = 0;
 
         filter::FilterPipeline filter_pipeline{};
         filter::FilterBindings filter_bindings{};
@@ -159,6 +185,10 @@ namespace pngp::vis::rays {
         vk::pipeline::GraphicsPipeline ray_pipeline;
         vk::pipeline::GraphicsPipeline ray_pipeline_v2;
         filter::FilterPipeline filter_pipeline_v2{};
+
+        vk::raii::DescriptorSetLayout v2_attribute_set_layout{nullptr};
+        vk::raii::DescriptorPool v2_attribute_pool{nullptr};
+        std::vector<vk::raii::DescriptorSet> v2_attribute_sets{};
         // ====================================================================
         // UI + playback state.
         // ====================================================================

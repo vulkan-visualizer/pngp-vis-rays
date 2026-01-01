@@ -36,11 +36,19 @@ namespace pngp::vis::rays::filter {
         std::uint32_t in_count = 0;
         std::uint32_t stride   = 1;
         std::uint32_t max_out  = 0;
-        std::uint32_t pad      = 0;
+        std::uint32_t flags    = 0;
+        std::uint32_t roi_min_x = 0;
+        std::uint32_t roi_min_y = 0;
+        std::uint32_t roi_max_x = 0;
+        std::uint32_t roi_max_y = 0;
+        std::uint32_t sample_state_mask = 0;
+        std::uint32_t omit_reason_mask  = 0;
+        std::uint32_t mask_id  = 0;
+        std::uint32_t batch_id = 0;
     };
 
     static_assert(std::is_standard_layout_v<FilterParams>);
-    static_assert(sizeof(FilterParams) == 16);
+    static_assert(sizeof(FilterParams) == 48);
 
     // ========================================================================
     // Pipeline bundle for compute filtering.
@@ -91,6 +99,24 @@ namespace pngp::vis::rays::filter {
             },
             {
                 .binding         = 2,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .descriptorCount = 1,
+                .stageFlags      = vk::ShaderStageFlagBits::eCompute,
+            },
+            {
+                .binding         = 3,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .descriptorCount = 1,
+                .stageFlags      = vk::ShaderStageFlagBits::eCompute,
+            },
+            {
+                .binding         = 4,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .descriptorCount = 1,
+                .stageFlags      = vk::ShaderStageFlagBits::eCompute,
+            },
+            {
+                .binding         = 5,
                 .descriptorType  = vk::DescriptorType::eStorageBuffer,
                 .descriptorCount = 1,
                 .stageFlags      = vk::ShaderStageFlagBits::eCompute,
@@ -149,7 +175,7 @@ namespace pngp::vis::rays::filter {
 
     export [[nodiscard]] FilterBindings create_filter_bindings(const vk::raii::Device& device) {
         const vk::DescriptorPoolSize pool_sizes[] = {
-            {vk::DescriptorType::eStorageBuffer, 3},
+            {vk::DescriptorType::eStorageBuffer, 6},
         };
 
         const vk::DescriptorPoolCreateInfo pool_ci{
@@ -181,10 +207,16 @@ namespace pngp::vis::rays::filter {
                                   const FilterBindings& bindings,
                                   const vk::memory::Buffer& in_buf,
                                   const vk::memory::Buffer& out_buf,
-                                  const vk::memory::Buffer& count_buf) {
+                                  const vk::memory::Buffer& count_buf,
+                                  const vk::memory::Buffer& sample_buf,
+                                  const vk::memory::Buffer& mask_buf,
+                                  const vk::memory::Buffer& batch_buf) {
         const vk::DescriptorBufferInfo in_info{*in_buf.buffer, 0, in_buf.size};
         const vk::DescriptorBufferInfo out_info{*out_buf.buffer, 0, out_buf.size};
         const vk::DescriptorBufferInfo count_info{*count_buf.buffer, 0, count_buf.size};
+        const vk::DescriptorBufferInfo sample_info{*sample_buf.buffer, 0, sample_buf.size};
+        const vk::DescriptorBufferInfo mask_info{*mask_buf.buffer, 0, mask_buf.size};
+        const vk::DescriptorBufferInfo batch_info{*batch_buf.buffer, 0, batch_buf.size};
 
         const vk::WriteDescriptorSet writes[] = {
             {
@@ -207,6 +239,27 @@ namespace pngp::vis::rays::filter {
                 .descriptorCount = 1,
                 .descriptorType  = vk::DescriptorType::eStorageBuffer,
                 .pBufferInfo     = &count_info,
+            },
+            {
+                .dstSet          = *bindings.set,
+                .dstBinding      = 3,
+                .descriptorCount = 1,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .pBufferInfo     = &sample_info,
+            },
+            {
+                .dstSet          = *bindings.set,
+                .dstBinding      = 4,
+                .descriptorCount = 1,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .pBufferInfo     = &mask_info,
+            },
+            {
+                .dstSet          = *bindings.set,
+                .dstBinding      = 5,
+                .descriptorCount = 1,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .pBufferInfo     = &batch_info,
             },
         };
 
