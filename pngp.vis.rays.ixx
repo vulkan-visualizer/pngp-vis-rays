@@ -69,6 +69,18 @@ namespace pngp::vis::rays {
     };
 
     // ========================================================================
+    // Ray visualization color modes.
+    // ========================================================================
+    enum class RayColorMode : std::uint32_t {
+        Direction = 0,
+        Flags     = 1,
+        MaskId    = 2,
+        BatchId   = 3,
+        ResultRgb = 4,
+        Depth     = 5,
+    };
+
+    // ========================================================================
     // Ray rendering + filter settings.
     // ========================================================================
     struct RaySettings {
@@ -77,6 +89,9 @@ namespace pngp::vis::rays {
         float opacity     = 0.7f;
         std::uint32_t stride   = 1;
         std::uint32_t max_rays = 250000;
+        RayColorMode color_mode = RayColorMode::Direction;
+        float depth_min = 0.0f;
+        float depth_max = 10.0f;
 
         bool roi_enabled = false;
         bool roi_initialized = false;
@@ -94,6 +109,28 @@ namespace pngp::vis::rays {
         bool filter_batch_id = false;
         std::uint32_t mask_id  = 0;
         std::uint32_t batch_id = 0;
+    };
+
+    // ========================================================================
+    // Sample visualization settings (v2 only).
+    // ========================================================================
+    enum class SampleColorMode : std::uint32_t {
+        State     = 0,
+        Omit      = 1,
+        Density   = 2,
+        Weight    = 3,
+        Contrib   = 4,
+    };
+
+    struct SampleSettings {
+        bool show_samples = false;
+        float point_size = 2.0f;
+        std::uint32_t stride = 1;
+        std::uint32_t max_samples = 300000;
+        SampleColorMode color_mode = SampleColorMode::State;
+        float density_scale = 1.0f;
+        float weight_scale  = 10.0f;
+        float contrib_scale = 1.0f;
     };
 
     export struct RaysInspectorInfo {
@@ -186,6 +223,11 @@ namespace pngp::vis::rays {
         vk::pipeline::GraphicsPipeline ray_pipeline_v2;
         filter::FilterPipeline filter_pipeline_v2{};
 
+        vk::raii::DescriptorSetLayout sample_set_layout{nullptr};
+        vk::raii::DescriptorPool sample_pool{nullptr};
+        vk::raii::DescriptorSet sample_set{nullptr};
+        vk::pipeline::GraphicsPipeline sample_pipeline;
+
         vk::raii::DescriptorSetLayout v2_attribute_set_layout{nullptr};
         vk::raii::DescriptorPool v2_attribute_pool{nullptr};
         std::vector<vk::raii::DescriptorSet> v2_attribute_sets{};
@@ -193,6 +235,7 @@ namespace pngp::vis::rays {
         // UI + playback state.
         // ====================================================================
         RaySettings rays{};
+        SampleSettings samples{};
         std::array<char, 512> record_path_buf{};
         std::string record_error{};
         bool request_open_record  = false;

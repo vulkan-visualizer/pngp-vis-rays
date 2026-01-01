@@ -92,6 +92,22 @@ namespace {
     struct RayPush {
         vk::math::mat4 mvp{};
         vk::math::vec4 params{};
+        std::uint32_t mode{};
+        std::uint32_t pad0{};
+        std::uint32_t pad1{};
+        std::uint32_t pad2{};
+    };
+
+    // =========================================================================
+    // Push constants consumed by sample_points_v2.slang.
+    // =========================================================================
+    struct SamplePush {
+        vk::math::mat4 mvp{};
+        vk::math::vec4 params{};
+        std::uint32_t mode{};
+        std::uint32_t stride{};
+        std::uint32_t pad0{};
+        std::uint32_t pad1{};
     };
 
     // =========================================================================
@@ -179,12 +195,29 @@ namespace {
     // Convert ray draw settings to shader-friendly constants.
     // =========================================================================
     RayPush make_ray_push(const RaySettings& rays, const vk::math::mat4& mvp) {
+        const float depth_range = std::max(0.0001f, rays.depth_max - rays.depth_min);
+        const float depth_scale = 1.0f / depth_range;
+        const float depth_bias  = -rays.depth_min * depth_scale;
         RayPush push{};
         push.mvp    = mvp;
         push.params = {std::max(0.001f, rays.line_length),
                        std::clamp(rays.opacity, 0.0f, 1.0f),
-                       0.0f,
-                       0.0f};
+                       depth_scale,
+                       depth_bias};
+        push.mode   = static_cast<std::uint32_t>(rays.color_mode);
+        return push;
+    }
+
+    SamplePush make_sample_push(const pngp::vis::rays::SampleSettings& samples,
+                                const vk::math::mat4& mvp) {
+        SamplePush push{};
+        push.mvp = mvp;
+        push.params = {std::max(0.5f, samples.point_size),
+                       std::max(0.0f, samples.density_scale),
+                       std::max(0.0f, samples.weight_scale),
+                       std::max(0.0f, samples.contrib_scale)};
+        push.mode   = static_cast<std::uint32_t>(samples.color_mode);
+        push.stride = std::max(1u, samples.stride);
         return push;
     }
 
@@ -215,16 +248,36 @@ namespace {
     // Descriptor set + pipeline helpers for ray line rendering.
     // =========================================================================
     vk::raii::DescriptorSetLayout create_ray_set_layout(const vk::raii::Device& device) {
-        const vk::DescriptorSetLayoutBinding binding{
-            .binding         = 0,
-            .descriptorType  = vk::DescriptorType::eStorageBuffer,
-            .descriptorCount = 1,
-            .stageFlags      = vk::ShaderStageFlagBits::eVertex,
+        const vk::DescriptorSetLayoutBinding bindings[] = {
+            {
+                .binding         = 0,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .descriptorCount = 1,
+                .stageFlags      = vk::ShaderStageFlagBits::eVertex,
+            },
+            {
+                .binding         = 1,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .descriptorCount = 1,
+                .stageFlags      = vk::ShaderStageFlagBits::eVertex,
+            },
+            {
+                .binding         = 2,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .descriptorCount = 1,
+                .stageFlags      = vk::ShaderStageFlagBits::eVertex,
+            },
+            {
+                .binding         = 3,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .descriptorCount = 1,
+                .stageFlags      = vk::ShaderStageFlagBits::eVertex,
+            },
         };
 
         const vk::DescriptorSetLayoutCreateInfo ci{
-            .bindingCount = 1,
-            .pBindings    = &binding,
+            .bindingCount = static_cast<std::uint32_t>(std::size(bindings)),
+            .pBindings    = bindings,
         };
         return vk::raii::DescriptorSetLayout{device, ci};
     }
@@ -232,7 +285,7 @@ namespace {
     vk::raii::DescriptorPool create_ray_pool(const vk::raii::Device& device) {
         const vk::DescriptorPoolSize pool_size{
             .type            = vk::DescriptorType::eStorageBuffer,
-            .descriptorCount = 1,
+            .descriptorCount = 4,
         };
         const vk::DescriptorPoolCreateInfo ci{
             .flags         = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
@@ -257,16 +310,45 @@ namespace {
 
     void update_ray_set(const vk::raii::Device& device,
                         const vk::raii::DescriptorSet& set,
-                        const vk::memory::Buffer& rays) {
-        const vk::DescriptorBufferInfo info{*rays.buffer, 0, rays.size};
-        const vk::WriteDescriptorSet write{
-            .dstSet          = *set,
-            .dstBinding      = 0,
-            .descriptorCount = 1,
-            .descriptorType  = vk::DescriptorType::eStorageBuffer,
-            .pBufferInfo     = &info,
+                        const vk::memory::Buffer& rays,
+                        const vk::memory::Buffer& results,
+                        const vk::memory::Buffer& mask_ids,
+                        const vk::memory::Buffer& batch_ids) {
+        const vk::DescriptorBufferInfo ray_info{*rays.buffer, 0, rays.size};
+        const vk::DescriptorBufferInfo result_info{*results.buffer, 0, results.size};
+        const vk::DescriptorBufferInfo mask_info{*mask_ids.buffer, 0, mask_ids.size};
+        const vk::DescriptorBufferInfo batch_info{*batch_ids.buffer, 0, batch_ids.size};
+        const vk::WriteDescriptorSet writes[] = {
+            {
+                .dstSet          = *set,
+                .dstBinding      = 0,
+                .descriptorCount = 1,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .pBufferInfo     = &ray_info,
+            },
+            {
+                .dstSet          = *set,
+                .dstBinding      = 1,
+                .descriptorCount = 1,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .pBufferInfo     = &result_info,
+            },
+            {
+                .dstSet          = *set,
+                .dstBinding      = 2,
+                .descriptorCount = 1,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .pBufferInfo     = &mask_info,
+            },
+            {
+                .dstSet          = *set,
+                .dstBinding      = 3,
+                .descriptorCount = 1,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .pBufferInfo     = &batch_info,
+            },
         };
-        device.updateDescriptorSets({write}, {});
+        device.updateDescriptorSets(writes, {});
     }
 
     // =========================================================================
@@ -438,6 +520,122 @@ namespace {
     }
 
     // =========================================================================
+    // Descriptor set + pipeline helpers for sample point rendering (v2 only).
+    // =========================================================================
+    vk::raii::DescriptorSetLayout create_sample_set_layout(const vk::raii::Device& device) {
+        const vk::DescriptorSetLayoutBinding bindings[] = {
+            {
+                .binding         = 0,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .descriptorCount = 1,
+                .stageFlags      = vk::ShaderStageFlagBits::eVertex,
+            },
+            {
+                .binding         = 1,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .descriptorCount = 1,
+                .stageFlags      = vk::ShaderStageFlagBits::eVertex,
+            },
+            {
+                .binding         = 2,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .descriptorCount = 1,
+                .stageFlags      = vk::ShaderStageFlagBits::eVertex,
+            },
+        };
+
+        const vk::DescriptorSetLayoutCreateInfo ci{
+            .bindingCount = static_cast<std::uint32_t>(std::size(bindings)),
+            .pBindings    = bindings,
+        };
+        return vk::raii::DescriptorSetLayout{device, ci};
+    }
+
+    vk::raii::DescriptorPool create_sample_pool(const vk::raii::Device& device) {
+        const vk::DescriptorPoolSize pool_size{
+            .type            = vk::DescriptorType::eStorageBuffer,
+            .descriptorCount = 3,
+        };
+        const vk::DescriptorPoolCreateInfo ci{
+            .flags         = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+            .maxSets       = 1,
+            .poolSizeCount = 1,
+            .pPoolSizes    = &pool_size,
+        };
+        return vk::raii::DescriptorPool{device, ci};
+    }
+
+    vk::raii::DescriptorSet allocate_sample_set(const vk::raii::Device& device,
+                                                const vk::raii::DescriptorPool& pool,
+                                                const vk::raii::DescriptorSetLayout& layout) {
+        const vk::DescriptorSetAllocateInfo ai{
+            .descriptorPool     = *pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts        = &*layout,
+        };
+        auto sets = vk::raii::DescriptorSets{device, ai};
+        return std::move(sets.front());
+    }
+
+    void update_sample_set(const vk::raii::Device& device,
+                           const vk::raii::DescriptorSet& set,
+                           const vk::memory::Buffer& rays,
+                           const vk::memory::Buffer& samples,
+                           const vk::memory::Buffer& evals) {
+        const vk::DescriptorBufferInfo ray_info{*rays.buffer, 0, rays.size};
+        const vk::DescriptorBufferInfo sample_info{*samples.buffer, 0, samples.size};
+        const vk::DescriptorBufferInfo eval_info{*evals.buffer, 0, evals.size};
+        const vk::WriteDescriptorSet writes[] = {
+            {
+                .dstSet          = *set,
+                .dstBinding      = 0,
+                .descriptorCount = 1,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .pBufferInfo     = &ray_info,
+            },
+            {
+                .dstSet          = *set,
+                .dstBinding      = 1,
+                .descriptorCount = 1,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .pBufferInfo     = &sample_info,
+            },
+            {
+                .dstSet          = *set,
+                .dstBinding      = 2,
+                .descriptorCount = 1,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .pBufferInfo     = &eval_info,
+            },
+        };
+        device.updateDescriptorSets(writes, {});
+    }
+
+    vk::pipeline::GraphicsPipeline create_sample_pipeline(const vk::context::VulkanContext& vkctx,
+                                                          const vk::swapchain::Swapchain& sc,
+                                                          const vk::raii::DescriptorSetLayout& set_layout) {
+        vk::pipeline::VertexInput vin{};
+        constexpr std::array paths{"../shaders/sample_points_v2.spv", "../shaders/sample_points_v2.spv"};
+        const auto spv = read_shader_bytes(paths);
+        auto shader    = vk::pipeline::load_shader_module(vkctx.device, spv);
+
+        vk::pipeline::GraphicsPipelineDesc desc{};
+        desc.color_format         = sc.format;
+        desc.depth_format         = sc.depth_format;
+        desc.use_depth            = true;
+        desc.cull                 = vk::CullModeFlagBits::eNone;
+        desc.front_face           = vk::FrontFace::eCounterClockwise;
+        desc.polygon_mode         = vk::PolygonMode::eFill;
+        desc.topology             = vk::PrimitiveTopology::ePointList;
+        desc.enable_blend         = true;
+        desc.push_constant_bytes  = sizeof(SamplePush);
+        desc.push_constant_stages = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
+        const vk::DescriptorSetLayout layouts[] = {*set_layout};
+        desc.set_layouts = layouts;
+        return vk::pipeline::create_graphics_pipeline(vkctx.device, vin, desc, shader, "vertMain", "fragMain");
+    }
+
+    // =========================================================================
     // Buffer allocation helpers for filtered rays and indirect draw command.
     // =========================================================================
     vk::memory::Buffer create_device_buffer(const vk::context::VulkanContext& vkctx,
@@ -517,6 +715,7 @@ void pngp::vis::rays::RaysInspector::run() {
             grid_pipeline = create_grid_pipeline(ctx, swapchain);
             ray_pipeline  = create_ray_pipeline(ctx, swapchain, ray_set_layout);
             ray_pipeline_v2 = create_ray_pipeline_v2(ctx, swapchain, ray_set_layout);
+            sample_pipeline = create_sample_pipeline(ctx, swapchain, sample_set_layout);
             continue;
         }
         vk::frame::begin_commands(frames, frame_index);
@@ -658,6 +857,7 @@ void pngp::vis::rays::RaysInspector::run() {
                     ensure_ray_buffers(ctx, desired, sizeof(record_v2::RayBaseRecordV2),
                                        ray_filtered, ray_count, ray_indirect, ray_capacity);
                     const auto& sample_buf = v2_samples.size > 0 ? v2_samples : dummy_storage;
+                    const auto& result_buf = v2_results.size > 0 ? v2_results : dummy_storage;
                     const auto& mask_buf =
                         (v2_mask_attr_index >= 0 && static_cast<std::size_t>(v2_mask_attr_index) < v2_attribute_buffers.size())
                             ? v2_attribute_buffers[static_cast<std::size_t>(v2_mask_attr_index)]
@@ -668,7 +868,10 @@ void pngp::vis::rays::RaysInspector::run() {
                             : dummy_storage;
                     filter::update_filter_set(ctx.device, filter_bindings, ray_input.buffer, ray_filtered, ray_count,
                                               sample_buf, mask_buf, batch_buf);
-                    update_ray_set(ctx.device, ray_set, ray_filtered);
+                    update_ray_set(ctx.device, ray_set, ray_filtered, result_buf, mask_buf, batch_buf);
+                    const auto& eval_buf = v2_evals.size > 0 ? v2_evals : dummy_storage;
+                    const auto& ray_buf  = ray_input.buffer.size > 0 ? ray_input.buffer : dummy_storage;
+                    update_sample_set(ctx.device, sample_set, ray_buf, sample_buf, eval_buf);
                     filter::update_indirect_set(ctx.device, indirect_bindings, ray_count, ray_indirect);
                     filter_dirty = true;
                 }
@@ -686,7 +889,7 @@ void pngp::vis::rays::RaysInspector::run() {
                                        ray_filtered, ray_count, ray_indirect, ray_capacity);
                     filter::update_filter_set(ctx.device, filter_bindings, ray_input.buffer, ray_filtered, ray_count,
                                               dummy_storage, dummy_storage, dummy_storage);
-                    update_ray_set(ctx.device, ray_set, ray_filtered);
+                    update_ray_set(ctx.device, ray_set, ray_filtered, dummy_storage, dummy_storage, dummy_storage);
                     filter::update_indirect_set(ctx.device, indirect_bindings, ray_count, ray_indirect);
                     filter_dirty = true;
                 }
@@ -707,6 +910,7 @@ void pngp::vis::rays::RaysInspector::run() {
                     ensure_ray_buffers(ctx, desired, element_bytes,
                                        ray_filtered, ray_count, ray_indirect, ray_capacity);
                     const auto& sample_buf = record_v2_active && v2_samples.size > 0 ? v2_samples : dummy_storage;
+                    const auto& result_buf = record_v2_active && v2_results.size > 0 ? v2_results : dummy_storage;
                     const auto& mask_buf =
                         (record_v2_active && v2_mask_attr_index >= 0 &&
                          static_cast<std::size_t>(v2_mask_attr_index) < v2_attribute_buffers.size())
@@ -719,7 +923,7 @@ void pngp::vis::rays::RaysInspector::run() {
                             : dummy_storage;
                     filter::update_filter_set(ctx.device, filter_bindings, ray_input.buffer, ray_filtered, ray_count,
                                               sample_buf, mask_buf, batch_buf);
-                    update_ray_set(ctx.device, ray_set, ray_filtered);
+                    update_ray_set(ctx.device, ray_set, ray_filtered, result_buf, mask_buf, batch_buf);
                     filter::update_indirect_set(ctx.device, indirect_bindings, ray_count, ray_indirect);
                     filter_dirty = true;
                 }
@@ -793,6 +997,7 @@ void pngp::vis::rays::RaysInspector::run() {
             grid_pipeline = create_grid_pipeline(ctx, swapchain);
             ray_pipeline  = create_ray_pipeline(ctx, swapchain, ray_set_layout);
             ray_pipeline_v2 = create_ray_pipeline_v2(ctx, swapchain, ray_set_layout);
+            sample_pipeline = create_sample_pipeline(ctx, swapchain, sample_set_layout);
         }
 
         frame_index = (frame_index + 1) % frames.frames_in_flight;
@@ -855,8 +1060,12 @@ pngp::vis::rays::RaysInspector::RaysInspector(const RaysInspectorInfo& info) {
     ray_pipeline     = create_ray_pipeline(ctx, swapchain, ray_set_layout);
     ray_pipeline_v2  = create_ray_pipeline_v2(ctx, swapchain, ray_set_layout);
     v2_attribute_set_layout = create_attribute_set_layout(ctx.device);
+    sample_set_layout = create_sample_set_layout(ctx.device);
+    sample_pool       = create_sample_pool(ctx.device);
+    sample_set        = allocate_sample_set(ctx.device, sample_pool, sample_set_layout);
+    sample_pipeline   = create_sample_pipeline(ctx, swapchain, sample_set_layout);
     {
-        std::array<std::byte, 16> zeros{};
+        std::array<std::byte, 64> zeros{};
         dummy_storage = upload_storage_buffer_non_empty(ctx, zeros);
     }
 
@@ -1126,6 +1335,25 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
         cmd.drawIndirect(*ray_indirect.buffer, 0, 1, sizeof(vk::DrawIndirectCommand));
     }
 
+    // ========================================================================
+    // Sample draw: v2 sample points (no compaction yet).
+    // ========================================================================
+    if (record_v2_active && samples.show_samples && v2_samples.size > 0) {
+        const auto sample_count_u64 = std::min<std::uint64_t>(active_frame_v2.sample_count,
+                                                             std::numeric_limits<std::uint32_t>::max());
+        const auto max_samples = std::max(1u, samples.max_samples);
+        const auto draw_count = static_cast<std::uint32_t>(std::min<std::uint64_t>(sample_count_u64, max_samples));
+        if (draw_count > 0) {
+            cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *sample_pipeline.pipeline);
+            cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *sample_pipeline.layout, 0, {*sample_set}, {});
+            const SamplePush push = make_sample_push(samples, grid_mvp);
+            cmd.pushConstants(*sample_pipeline.layout,
+                              vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+                              vk::ArrayProxy<const SamplePush>{push});
+            cmd.draw(draw_count, 1, 0, 0);
+        }
+    }
+
     cmd.endRendering();
 
     // ========================================================================
@@ -1259,8 +1487,28 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
     }
 
     ImGui::Separator();
-    ImGui::TextUnformatted("Ray Filter");
+    ImGui::TextUnformatted("Ray Visualization");
     ImGui::Checkbox("Show rays", &rays.show_rays);
+    {
+        const char* modes[] = {
+            "Direction",
+            "Flags",
+            "Mask id",
+            "Batch id",
+            "Result RGB",
+            "Depth",
+        };
+        int mode = static_cast<int>(rays.color_mode);
+        if (ImGui::Combo("Ray color", &mode, modes, static_cast<int>(std::size(modes)))) {
+            rays.color_mode = static_cast<pngp::vis::rays::RayColorMode>(mode);
+        }
+        if (rays.color_mode == pngp::vis::rays::RayColorMode::Depth) {
+            ImGui::SliderFloat("Depth min", &rays.depth_min, 0.0f, rays.depth_max);
+            ImGui::SliderFloat("Depth max", &rays.depth_max, rays.depth_min, rays.depth_min + 1000.0f);
+        }
+    }
+    ImGui::Separator();
+    ImGui::TextUnformatted("Ray Filter");
     ImGui::SliderFloat("Line length", &rays.line_length, 0.1f, 100.0f);
     ImGui::SliderFloat("Opacity", &rays.opacity, 0.05f, 1.0f);
     {
@@ -1398,6 +1646,47 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
         if (ImGui::InputInt("Batch id", &value)) {
             rays.batch_id = static_cast<std::uint32_t>(std::max(0, value));
             filter_dirty = true;
+        }
+    }
+    ImGui::EndDisabled();
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Sample Visualization (v2)");
+    ImGui::BeginDisabled(!(record_v2_active && record_v2_reader.is_open()));
+    ImGui::Checkbox("Show samples", &samples.show_samples);
+    ImGui::SliderFloat("Point size", &samples.point_size, 0.5f, 10.0f);
+    {
+        int stride = static_cast<int>(samples.stride);
+        if (ImGui::SliderInt("Sample stride", &stride, 1, 64)) {
+            samples.stride = static_cast<std::uint32_t>(stride);
+        }
+    }
+    {
+        int max_samples = static_cast<int>(samples.max_samples);
+        if (ImGui::SliderInt("Max samples", &max_samples, 1, 5000000)) {
+            samples.max_samples = static_cast<std::uint32_t>(max_samples);
+        }
+    }
+    {
+        const char* modes[] = {
+            "State",
+            "Omit reason",
+            "Density",
+            "Weight",
+            "Contribution",
+        };
+        int mode = static_cast<int>(samples.color_mode);
+        if (ImGui::Combo("Sample color", &mode, modes, static_cast<int>(std::size(modes)))) {
+            samples.color_mode = static_cast<pngp::vis::rays::SampleColorMode>(mode);
+        }
+        if (samples.color_mode == pngp::vis::rays::SampleColorMode::Density) {
+            ImGui::SliderFloat("Density scale", &samples.density_scale, 0.0f, 10.0f);
+        }
+        if (samples.color_mode == pngp::vis::rays::SampleColorMode::Weight) {
+            ImGui::SliderFloat("Weight scale", &samples.weight_scale, 0.0f, 50.0f);
+        }
+        if (samples.color_mode == pngp::vis::rays::SampleColorMode::Contrib) {
+            ImGui::SliderFloat("Contrib scale", &samples.contrib_scale, 0.0f, 10.0f);
         }
     }
     ImGui::EndDisabled();
