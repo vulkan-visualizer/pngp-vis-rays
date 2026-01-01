@@ -10,7 +10,7 @@ struct DrawIndirectCommand {
 
 [[vk::binding(0, 0)]]
 StructuredBuffer<uint> in_count;
-[[vk::binding(0, 1)]]
+[[vk::binding(1, 0)]]
 RWStructuredBuffer<DrawIndirectCommand> out_draw;
 
 [shader("compute")]
@@ -20,8 +20,8 @@ void compMain(uint3 tid : SV_DispatchThreadID) {
     const uint rays = in_count[0];
 
     DrawIndirectCommand cmd;
-    cmd.vertexCount   = rays * 2u;
-    cmd.instanceCount = 1u;
+    cmd.vertexCount   = 2u;
+    cmd.instanceCount = rays;
     cmd.firstVertex   = 0u;
     cmd.firstInstance = 0u;
     out_draw[0] = cmd;

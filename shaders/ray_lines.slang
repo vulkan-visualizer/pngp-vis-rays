@@ -36,8 +36,8 @@ struct VsOut {
 // Vertex shader: build a line segment per ray using SV_VertexID.
 // ============================================================================
 [shader("vertex")]
-VsOut vertMain(uint vertex_id : SV_VertexID) {
-    const uint ray_index = vertex_id >> 1;
+VsOut vertMain(uint vertex_id : SV_VertexID, uint instance_id : SV_InstanceID) {
+    const uint ray_index = instance_id;
     const bool is_end = (vertex_id & 1u) == 1u;
 
     const RayRecord r = rays[ray_index];

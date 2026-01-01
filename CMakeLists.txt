@@ -14,6 +14,7 @@ set(CMAKE_CXX_SCAN_FOR_MODULES ON)
 
 
 add_subdirectory(vulkan-visualizer)
+add_subdirectory(ray_generator)
 
 include(CMakeParseArguments)
 function(add_slang_shader_target)

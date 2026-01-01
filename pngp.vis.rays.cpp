@@ -387,6 +387,7 @@ void pngp::vis::rays::RaysInspector::run() {
                     playback.open(record_path_buf.data());
                     active_frame_index = 0;
                     request_frame_upload = true;
+                    filter_dirty = true;
                 } catch (const std::exception& e) {
                     record_error = e.what();
                     playback.close();
@@ -410,6 +411,7 @@ void pngp::vis::rays::RaysInspector::run() {
                     filter::update_filter_set(ctx.device, filter_bindings, ray_input.buffer, ray_filtered, ray_count);
                     update_ray_set(ctx.device, ray_set, ray_filtered);
                     filter::update_indirect_set(ctx.device, indirect_bindings, ray_count, ray_indirect);
+                    filter_dirty = true;
                 }
             }
         }
@@ -426,6 +428,7 @@ void pngp::vis::rays::RaysInspector::run() {
                     filter::update_filter_set(ctx.device, filter_bindings, ray_input.buffer, ray_filtered, ray_count);
                     update_ray_set(ctx.device, ray_set, ray_filtered);
                     filter::update_indirect_set(ctx.device, indirect_bindings, ray_count, ray_indirect);
+                    filter_dirty = true;
                 }
             }
         }
@@ -628,7 +631,7 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
     const std::uint32_t ray_stride  = std::max(1u, rays.stride);
     const std::uint32_t ray_max_out = std::min(std::min(rays.max_rays, ray_capacity), in_count);
 
-    if (can_dispatch && ray_max_out > 0) {
+    if (can_dispatch && ray_max_out > 0 && filter_dirty) {
         cmd.fillBuffer(*ray_count.buffer, 0, ray_count.size, 0);
 
         const vk::BufferMemoryBarrier2 clear_barrier{
@@ -698,6 +701,7 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
             .pBufferMemoryBarriers    = barriers,
         };
         cmd.pipelineBarrier2(ray_dep);
+        filter_dirty = false;
     }
 
     // ========================================================================
@@ -860,6 +864,7 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
         int stride = static_cast<int>(rays.stride);
         if (ImGui::SliderInt("Stride", &stride, 1, 64)) {
             rays.stride = static_cast<std::uint32_t>(stride);
+            filter_dirty = true;
         }
     }
     {
@@ -867,6 +872,7 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
         if (ImGui::SliderInt("Max rays", &max_rays, 1, 2000000)) {
             rays.max_rays = static_cast<std::uint32_t>(max_rays);
             request_ray_resize = true;
+            filter_dirty = true;
         }
     }
     ImGui::End();

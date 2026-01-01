@@ -26,9 +26,9 @@ cbuffer PushConstants {
 
 [[vk::binding(0, 0)]]
 StructuredBuffer<RayRecord> in_rays;
-[[vk::binding(0, 1)]]
+[[vk::binding(1, 0)]]
 RWStructuredBuffer<RayRecord> out_rays;
-[[vk::binding(0, 2)]]
+[[vk::binding(2, 0)]]
 RWStructuredBuffer<uint> out_count;
 
 [shader("compute")]
@@ -45,7 +45,7 @@ void compMain(uint3 tid : SV_DispatchThreadID) {
         if (expected >= params.max_out) return;
 
         uint original = 0;
-        InterlockedCompareExchange(out_count[0], expected + 1, expected, original);
+        InterlockedCompareExchange(out_count[0], expected, expected + 1, original);
         if (original == expected) {
             dst = expected;
             break;

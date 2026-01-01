@@ -160,6 +160,7 @@ namespace pngp::vis::rays {
         bool request_close_record = false;
         bool request_frame_upload = false;
         bool request_ray_resize   = false;
+        bool filter_dirty         = true;
         // ====================================================================
         // UI + input state.
         // ====================================================================
