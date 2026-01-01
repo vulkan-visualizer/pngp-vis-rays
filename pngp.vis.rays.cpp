@@ -279,15 +279,15 @@ pngp::vis::rays::RaysInspector::RaysInspector(const RaysInspectorInfo& info) {
 
     this->ctx       = std::move(vkctx);
     this->surface   = std::move(surface);
-    this->swapchain = vk::swapchain::setup_swapchain(this->ctx, this->surface);
-    this->frames    = vk::frame::create_frame_system(this->ctx, this->swapchain, 2);
-    this->imgui     = vk::imgui::create(this->ctx, this->surface.window.get(), this->swapchain.format, 2, static_cast<std::uint32_t>(this->swapchain.images.size()), info.render.enable_docking, info.render.enable_viewports);
-
     glfwSetWindowUserPointer(this->surface.window.get(), &this->input);
     glfwSetKeyCallback(this->surface.window.get(), &glfw_key_cb);
     glfwSetMouseButtonCallback(this->surface.window.get(), &glfw_mouse_button_cb);
     glfwSetCursorPosCallback(this->surface.window.get(), &glfw_cursor_pos_cb);
     glfwSetScrollCallback(this->surface.window.get(), &glfw_scroll_cb);
+
+    this->swapchain = vk::swapchain::setup_swapchain(this->ctx, this->surface);
+    this->frames    = vk::frame::create_frame_system(this->ctx, this->swapchain, 2);
+    this->imgui     = vk::imgui::create(this->ctx, this->surface.window.get(), this->swapchain.format, 2, static_cast<std::uint32_t>(this->swapchain.images.size()), info.render.enable_docking, info.render.enable_viewports);
 
     vk::camera::CameraConfig cam_cfg{};
     cam_cfg.fov_y_rad = info.render.fov_y_rad;
