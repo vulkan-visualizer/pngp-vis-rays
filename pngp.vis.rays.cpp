@@ -506,7 +506,7 @@ namespace {
     vk::pipeline::GraphicsPipeline create_ray_pipeline(const vk::context::VulkanContext& vkctx,
                                                        const vk::swapchain::Swapchain& sc,
                                                        const vk::raii::DescriptorSetLayout& set_layout) {
-        constexpr std::array paths{"shaders/ray_lines_v2.spv", "../shaders/ray_lines_v2.spv"};
+        constexpr std::array paths{"../shaders/ray_lines_v2.spv", "../shaders/ray_lines_v2.spv"};
         return create_ray_pipeline_with_paths(vkctx, sc, set_layout, paths);
     }
 

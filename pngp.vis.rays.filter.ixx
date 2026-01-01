@@ -165,8 +165,8 @@ namespace pngp::vis::rays::filter {
 
     export [[nodiscard]] FilterPipeline create_filter_pipeline(const vk::raii::Device& device) {
         constexpr std::array paths{
-            "shaders/compute/ray_filter_v2.spv",
-            "../shaders/compute/ray_filter_v2.spv",
+            "shaders/ray_filter_v2.spv",
+            "../shaders/ray_filter_v2.spv",
         };
         return create_filter_pipeline_from_paths_(device, paths);
     }
