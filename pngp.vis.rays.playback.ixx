@@ -11,7 +11,7 @@ namespace pngp::vis::rays::playback {
     // ========================================================================
     // CPU frame payload: header + rays + samples.
     // ========================================================================
-    struct RayFrameCPU {
+    export struct RayFrameCPU {
         record::FrameHeader header{};
         std::vector<record::RayRecord> rays{};
         std::vector<record::SampleRecord> samples{};
@@ -20,12 +20,12 @@ namespace pngp::vis::rays::playback {
     // ========================================================================
     // GPU buffers for a frame.
     // ========================================================================
-    struct RayBufferGPU {
+    export struct RayBufferGPU {
         vk::memory::Buffer buffer{};
         std::uint64_t count{};
     };
 
-    struct SampleBufferGPU {
+    export struct SampleBufferGPU {
         vk::memory::Buffer buffer{};
         std::uint64_t count{};
     };

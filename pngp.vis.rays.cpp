@@ -12,6 +12,9 @@ import vk.pipeline;
 import vk.memory;
 import vk.geometry;
 import vk.math;
+import pngp.vis.rays.record;
+import pngp.vis.rays.playback;
+import pngp.vis.rays.filter;
 
 // ============================================================================
 // Translation-unit helpers (input callbacks, grid helpers, pipeline setup).
@@ -19,6 +22,7 @@ import vk.math;
 namespace {
     using pngp::vis::rays::GridSettings;
     using pngp::vis::rays::InputState;
+    using pngp::vis::rays::RaySettings;
 
     // =========================================================================
     // GLFW input callbacks: collect raw input into InputState.
@@ -74,6 +78,14 @@ namespace {
         vk::math::mat4 mvp{};
         vk::math::vec4 grid{};
         vk::math::vec4 toggles{};
+    };
+
+    // =========================================================================
+    // Push constants consumed by ray_lines.slang.
+    // =========================================================================
+    struct RayPush {
+        vk::math::mat4 mvp{};
+        vk::math::vec4 params{};
     };
 
     // =========================================================================
@@ -135,6 +147,19 @@ namespace {
     }
 
     // =========================================================================
+    // Convert ray draw settings to shader-friendly constants.
+    // =========================================================================
+    RayPush make_ray_push(const RaySettings& rays, const vk::math::mat4& mvp) {
+        RayPush push{};
+        push.mvp    = mvp;
+        push.params = {std::max(0.001f, rays.line_length),
+                       std::clamp(rays.opacity, 0.0f, 1.0f),
+                       0.0f,
+                       0.0f};
+        return push;
+    }
+
+    // =========================================================================
     // Minimal pipeline for a transparent grid surface with depth testing.
     // =========================================================================
     vk::pipeline::GraphicsPipeline create_grid_pipeline(const vk::context::VulkanContext& vkctx, const vk::swapchain::Swapchain& sc) {
@@ -155,6 +180,123 @@ namespace {
         desc.push_constant_bytes  = sizeof(GridPush);
         desc.push_constant_stages = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
         return vk::pipeline::create_graphics_pipeline(vkctx.device, vin, desc, shader, "vertMain", "fragMain");
+    }
+
+    // =========================================================================
+    // Descriptor set + pipeline helpers for ray line rendering.
+    // =========================================================================
+    vk::raii::DescriptorSetLayout create_ray_set_layout(const vk::raii::Device& device) {
+        const vk::DescriptorSetLayoutBinding binding{
+            .binding         = 0,
+            .descriptorType  = vk::DescriptorType::eStorageBuffer,
+            .descriptorCount = 1,
+            .stageFlags      = vk::ShaderStageFlagBits::eVertex,
+        };
+
+        const vk::DescriptorSetLayoutCreateInfo ci{
+            .bindingCount = 1,
+            .pBindings    = &binding,
+        };
+        return vk::raii::DescriptorSetLayout{device, ci};
+    }
+
+    vk::raii::DescriptorPool create_ray_pool(const vk::raii::Device& device) {
+        const vk::DescriptorPoolSize pool_size{
+            .type            = vk::DescriptorType::eStorageBuffer,
+            .descriptorCount = 1,
+        };
+        const vk::DescriptorPoolCreateInfo ci{
+            .flags         = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+            .maxSets       = 1,
+            .poolSizeCount = 1,
+            .pPoolSizes    = &pool_size,
+        };
+        return vk::raii::DescriptorPool{device, ci};
+    }
+
+    vk::raii::DescriptorSet allocate_ray_set(const vk::raii::Device& device,
+                                             const vk::raii::DescriptorPool& pool,
+                                             const vk::raii::DescriptorSetLayout& layout) {
+        const vk::DescriptorSetAllocateInfo ai{
+            .descriptorPool     = *pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts        = &*layout,
+        };
+        auto sets = vk::raii::DescriptorSets{device, ai};
+        return std::move(sets.front());
+    }
+
+    void update_ray_set(const vk::raii::Device& device,
+                        const vk::raii::DescriptorSet& set,
+                        const vk::memory::Buffer& rays) {
+        const vk::DescriptorBufferInfo info{*rays.buffer, 0, rays.size};
+        const vk::WriteDescriptorSet write{
+            .dstSet          = *set,
+            .dstBinding      = 0,
+            .descriptorCount = 1,
+            .descriptorType  = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo     = &info,
+        };
+        device.updateDescriptorSets({write}, {});
+    }
+
+    vk::pipeline::GraphicsPipeline create_ray_pipeline(const vk::context::VulkanContext& vkctx,
+                                                       const vk::swapchain::Swapchain& sc,
+                                                       const vk::raii::DescriptorSetLayout& set_layout) {
+        vk::pipeline::VertexInput vin{};
+        constexpr std::array paths{"shaders/ray_lines.spv", "../shaders/ray_lines.spv"};
+        const auto spv = read_shader_bytes(paths);
+        auto shader    = vk::pipeline::load_shader_module(vkctx.device, spv);
+
+        vk::pipeline::GraphicsPipelineDesc desc{};
+        desc.color_format         = sc.format;
+        desc.depth_format         = sc.depth_format;
+        desc.use_depth            = true;
+        desc.cull                 = vk::CullModeFlagBits::eNone;
+        desc.front_face           = vk::FrontFace::eCounterClockwise;
+        desc.polygon_mode         = vk::PolygonMode::eFill;
+        desc.topology             = vk::PrimitiveTopology::eLineList;
+        desc.enable_blend         = true;
+        desc.push_constant_bytes  = sizeof(RayPush);
+        desc.push_constant_stages = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
+        const vk::DescriptorSetLayout layouts[] = {*set_layout};
+        desc.set_layouts = layouts;
+        return vk::pipeline::create_graphics_pipeline(vkctx.device, vin, desc, shader, "vertMain", "fragMain");
+    }
+
+    // =========================================================================
+    // Buffer allocation helpers for filtered rays and indirect draw command.
+    // =========================================================================
+    vk::memory::Buffer create_device_buffer(const vk::context::VulkanContext& vkctx,
+                                            const vk::DeviceSize size,
+                                            const vk::BufferUsageFlags usage) {
+        if (size == 0) return {};
+        return vk::memory::create_buffer(vkctx.physical_device, vkctx.device, size, usage,
+                                         vk::MemoryPropertyFlagBits::eDeviceLocal);
+    }
+
+    void ensure_ray_buffers(const vk::context::VulkanContext& vkctx,
+                            const std::uint32_t desired_capacity,
+                            vk::memory::Buffer& filtered,
+                            vk::memory::Buffer& count,
+                            vk::memory::Buffer& indirect,
+                            std::uint32_t& capacity) {
+        const std::uint32_t safe_capacity = std::max(1u, desired_capacity);
+        if (safe_capacity > capacity || filtered.size == 0) {
+            const vk::DeviceSize size_bytes = static_cast<vk::DeviceSize>(safe_capacity) * sizeof(pngp::vis::rays::record::RayRecord);
+            filtered = create_device_buffer(vkctx, size_bytes, vk::BufferUsageFlagBits::eStorageBuffer);
+            capacity = safe_capacity;
+        }
+
+        if (count.size == 0) {
+            count = create_device_buffer(vkctx, sizeof(std::uint32_t),
+                                         vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst);
+        }
+
+        if (indirect.size == 0) {
+            indirect = create_device_buffer(vkctx, sizeof(vk::DrawIndirectCommand),
+                                            vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eIndirectBuffer);
+        }
     }
 } // namespace
 
@@ -199,6 +341,7 @@ void pngp::vis::rays::RaysInspector::run() {
             vk::imgui::set_min_image_count(imgui, 2);
             ctx.device.waitIdle();
             grid_pipeline = create_grid_pipeline(ctx, swapchain);
+            ray_pipeline  = create_ray_pipeline(ctx, swapchain, ray_set_layout);
             continue;
         }
         vk::frame::begin_commands(frames, frame_index);
@@ -216,6 +359,75 @@ void pngp::vis::rays::RaysInspector::run() {
             ctx.device.waitIdle();
             const auto mesh_cpu = build_ground_plane(grid.grid_extent);
             grid_mesh           = upload_mesh_safe(ctx, mesh_cpu);
+        }
+
+        // ====================================================================
+        // Handle playback requests and GPU buffer updates.
+        // ====================================================================
+        if (request_close_record) {
+            request_close_record = false;
+            ctx.device.waitIdle();
+            playback.close();
+            ray_input     = {};
+            ray_filtered  = {};
+            ray_count     = {};
+            ray_indirect  = {};
+            ray_capacity  = 0;
+            active_frame  = {};
+            record_error.clear();
+        }
+
+        if (request_open_record) {
+            request_open_record = false;
+            record_error.clear();
+            if (record_path_buf[0] == '\0') {
+                record_error = "Record path is empty.";
+            } else {
+                try {
+                    playback.open(record_path_buf.data());
+                    active_frame_index = 0;
+                    request_frame_upload = true;
+                } catch (const std::exception& e) {
+                    record_error = e.what();
+                    playback.close();
+                }
+            }
+        }
+
+        if (request_frame_upload) {
+            request_frame_upload = false;
+            if (playback.is_open()) {
+                ctx.device.waitIdle();
+                const auto frame = playback.load_frame(active_frame_index);
+                active_frame = frame.header;
+                ray_input = playback.upload_rays(ctx, frame.rays);
+
+                const auto in_count_u64 = std::min<std::uint64_t>(ray_input.count, std::numeric_limits<std::uint32_t>::max());
+                const auto in_count = static_cast<std::uint32_t>(in_count_u64);
+                if (in_count > 0) {
+                    const std::uint32_t desired = std::min(rays.max_rays, in_count);
+                    ensure_ray_buffers(ctx, desired, ray_filtered, ray_count, ray_indirect, ray_capacity);
+                    filter::update_filter_set(ctx.device, filter_bindings, ray_input.buffer, ray_filtered, ray_count);
+                    update_ray_set(ctx.device, ray_set, ray_filtered);
+                    filter::update_indirect_set(ctx.device, indirect_bindings, ray_count, ray_indirect);
+                }
+            }
+        }
+
+        if (request_ray_resize) {
+            request_ray_resize = false;
+            const auto in_count_u64 = std::min<std::uint64_t>(ray_input.count, std::numeric_limits<std::uint32_t>::max());
+            const auto in_count = static_cast<std::uint32_t>(in_count_u64);
+            if (in_count > 0) {
+                const std::uint32_t desired = std::min(rays.max_rays, in_count);
+                if (desired > ray_capacity) {
+                    ctx.device.waitIdle();
+                    ensure_ray_buffers(ctx, desired, ray_filtered, ray_count, ray_indirect, ray_capacity);
+                    filter::update_filter_set(ctx.device, filter_bindings, ray_input.buffer, ray_filtered, ray_count);
+                    update_ray_set(ctx.device, ray_set, ray_filtered);
+                    filter::update_indirect_set(ctx.device, indirect_bindings, ray_count, ray_indirect);
+                }
+            }
         }
 
         // ====================================================================
@@ -283,6 +495,7 @@ void pngp::vis::rays::RaysInspector::run() {
             vk::imgui::set_min_image_count(imgui, 2);
             ctx.device.waitIdle();
             grid_pipeline = create_grid_pipeline(ctx, swapchain);
+            ray_pipeline  = create_ray_pipeline(ctx, swapchain, ray_set_layout);
         }
 
         frame_index = (frame_index + 1) % frames.frames_in_flight;
@@ -335,6 +548,22 @@ pngp::vis::rays::RaysInspector::RaysInspector(const RaysInspectorInfo& info) {
     const auto mesh_cpu = build_ground_plane(grid.grid_extent);
     grid_mesh           = upload_mesh_safe(ctx, mesh_cpu);
     grid_pipeline       = create_grid_pipeline(ctx, swapchain);
+
+    // ========================================================================
+    // Ray rendering + compute pipelines.
+    // ========================================================================
+    ray_set_layout   = create_ray_set_layout(ctx.device);
+    ray_pool         = create_ray_pool(ctx.device);
+    ray_set          = allocate_ray_set(ctx.device, ray_pool, ray_set_layout);
+    ray_pipeline     = create_ray_pipeline(ctx, swapchain, ray_set_layout);
+
+    filter_pipeline  = filter::create_filter_pipeline(ctx.device, swapchain.format);
+    filter_bindings  = filter::create_filter_bindings(ctx.device);
+    filter::allocate_filter_set(ctx.device, filter_pipeline, filter_bindings);
+
+    indirect_pipeline = filter::create_indirect_pipeline(ctx.device);
+    indirect_bindings = filter::create_indirect_bindings(ctx.device);
+    filter::allocate_indirect_set(ctx.device, indirect_pipeline, indirect_bindings);
 }
 
 // ============================================================================
@@ -387,6 +616,88 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
 
         cmd.pipelineBarrier2(dep);
         swapchain.depth_layout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
+    }
+
+    // ========================================================================
+    // GPU filter + indirect build for rays (compute before rendering).
+    // ========================================================================
+    const auto in_count_u64 = std::min<std::uint64_t>(ray_input.count, std::numeric_limits<std::uint32_t>::max());
+    const auto in_count     = static_cast<std::uint32_t>(in_count_u64);
+    const bool can_dispatch = rays.show_rays && in_count > 0 && ray_capacity > 0 &&
+                              ray_filtered.size > 0 && ray_count.size > 0 && ray_indirect.size > 0;
+    const std::uint32_t ray_stride  = std::max(1u, rays.stride);
+    const std::uint32_t ray_max_out = std::min(std::min(rays.max_rays, ray_capacity), in_count);
+
+    if (can_dispatch && ray_max_out > 0) {
+        cmd.fillBuffer(*ray_count.buffer, 0, ray_count.size, 0);
+
+        const vk::BufferMemoryBarrier2 clear_barrier{
+            .srcStageMask  = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+            .buffer        = *ray_count.buffer,
+            .offset        = 0,
+            .size          = ray_count.size,
+        };
+
+        const vk::DependencyInfo clear_dep{
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers    = &clear_barrier,
+        };
+        cmd.pipelineBarrier2(clear_dep);
+
+        filter::FilterParams params{};
+        params.in_count = in_count;
+        params.stride   = ray_stride;
+        params.max_out  = ray_max_out;
+        const std::uint32_t group_count = (in_count + 255u) / 256u;
+        filter::dispatch_filter(cmd, filter_pipeline, filter_bindings, params, group_count);
+
+        const vk::BufferMemoryBarrier2 count_barrier{
+            .srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+            .dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .buffer        = *ray_count.buffer,
+            .offset        = 0,
+            .size          = ray_count.size,
+        };
+
+        const vk::DependencyInfo count_dep{
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers    = &count_barrier,
+        };
+        cmd.pipelineBarrier2(count_dep);
+
+        filter::dispatch_indirect(cmd, indirect_pipeline, indirect_bindings);
+
+        const vk::BufferMemoryBarrier2 barriers[] = {
+            {
+                .srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader,
+                .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                .dstStageMask  = vk::PipelineStageFlagBits2::eVertexShader,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                .buffer        = *ray_filtered.buffer,
+                .offset        = 0,
+                .size          = ray_filtered.size,
+            },
+            {
+                .srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader,
+                .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                .dstStageMask  = vk::PipelineStageFlagBits2::eDrawIndirect,
+                .dstAccessMask = vk::AccessFlagBits2::eIndirectCommandRead,
+                .buffer        = *ray_indirect.buffer,
+                .offset        = 0,
+                .size          = ray_indirect.size,
+            },
+        };
+
+        const vk::DependencyInfo ray_dep{
+            .bufferMemoryBarrierCount = static_cast<std::uint32_t>(std::size(barriers)),
+            .pBufferMemoryBarriers    = barriers,
+        };
+        cmd.pipelineBarrier2(ray_dep);
     }
 
     // ========================================================================
@@ -452,6 +763,19 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
         cmd.drawIndexed(grid_mesh.index_count, 1, 0, 0, 0);
     }
 
+    // ========================================================================
+    // Ray draw: compacted line list + indirect draw.
+    // ========================================================================
+    if (can_dispatch && ray_max_out > 0) {
+        cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *ray_pipeline.pipeline);
+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *ray_pipeline.layout, 0, {*ray_set}, {});
+
+        const RayPush push = make_ray_push(rays, grid_mvp);
+        cmd.pushConstants(*ray_pipeline.layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+                          vk::ArrayProxy<const RayPush>{push});
+        cmd.drawIndirect(*ray_indirect.buffer, 0, 1, sizeof(vk::DrawIndirectCommand));
+    }
+
     cmd.endRendering();
 
     // ========================================================================
@@ -504,6 +828,47 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
     ImGui::Checkbox("Fly mode", &grid.fly_mode);
     ImGui::TextUnformatted("Orbit: Alt/Space + LMB rotate, MMB pan, wheel zoom");
     ImGui::TextUnformatted("Fly: RMB look + WASD move, Q/E down/up");
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Ray Playback");
+    ImGui::InputText("Record path", record_path_buf.data(), record_path_buf.size());
+    if (ImGui::Button("Open")) request_open_record = true;
+    ImGui::SameLine();
+    if (ImGui::Button("Close")) request_close_record = true;
+    if (!record_error.empty()) ImGui::TextWrapped("%s", record_error.c_str());
+
+    if (playback.is_open()) {
+        const auto total_frames = playback.frame_count();
+        ImGui::Text("Frames: %zu", total_frames);
+        if (total_frames > 0) {
+            int frame = static_cast<int>(active_frame_index);
+            const int max_frame = static_cast<int>(total_frames - 1);
+            if (ImGui::SliderInt("Frame", &frame, 0, max_frame)) {
+                active_frame_index = static_cast<std::size_t>(frame);
+                request_frame_upload = true;
+            }
+            ImGui::Text("Rays: %llu", static_cast<unsigned long long>(active_frame.ray_count));
+        }
+    }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Ray Filter");
+    ImGui::Checkbox("Show rays", &rays.show_rays);
+    ImGui::SliderFloat("Line length", &rays.line_length, 0.1f, 100.0f);
+    ImGui::SliderFloat("Opacity", &rays.opacity, 0.05f, 1.0f);
+    {
+        int stride = static_cast<int>(rays.stride);
+        if (ImGui::SliderInt("Stride", &stride, 1, 64)) {
+            rays.stride = static_cast<std::uint32_t>(stride);
+        }
+    }
+    {
+        int max_rays = static_cast<int>(rays.max_rays);
+        if (ImGui::SliderInt("Max rays", &max_rays, 1, 2000000)) {
+            rays.max_rays = static_cast<std::uint32_t>(max_rays);
+            request_ray_resize = true;
+        }
+    }
     ImGui::End();
     return rebuild;
 }

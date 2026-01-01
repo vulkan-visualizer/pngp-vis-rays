@@ -23,7 +23,7 @@ function(add_slang_shader_target)
             SLANG
             ""
             "TARGET;OUTPUT_DIR"
-            "SOURCES"
+            "SOURCES;ENTRY_POINTS"
             ${ARGN}
     )
 
@@ -41,10 +41,14 @@ function(add_slang_shader_target)
 
     set(OUTPUTS)
 
+    set(SLANG_ENTRY_POINTS ${SLANG_ENTRY_POINTS})
+    if (NOT SLANG_ENTRY_POINTS)
+        set(SLANG_ENTRY_POINTS -entry vertMain -entry fragMain)
+    endif ()
+
     foreach (SRC ${SLANG_SOURCES})
         get_filename_component(SHADER_NAME ${SRC} NAME_WE)
         set(SPV ${SLANG_OUTPUT_DIR}/${SHADER_NAME}.spv)
-        set(ENTRY_POINTS -entry vertMain -entry fragMain)
         add_custom_command(
                 OUTPUT ${SPV}
                 COMMAND ${CMAKE_COMMAND} -E make_directory ${SLANG_OUTPUT_DIR}
@@ -54,7 +58,7 @@ function(add_slang_shader_target)
                 -profile spirv_1_4
                 -emit-spirv-directly
                 -fvk-use-entrypoint-name
-                ${ENTRY_POINTS}
+                ${SLANG_ENTRY_POINTS}
                 -o ${SPV}
                 DEPENDS ${SRC}
                 COMMENT "Compiling Slang shader: ${SRC}"
@@ -83,6 +87,18 @@ add_slang_shader_target(
         SOURCES ${SHADER_SLANG_SOURCES}
 )
 
+file(GLOB SHADER_SLANG_COMPUTE_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/shaders/compute/*.slang
+)
+
+if (SHADER_SLANG_COMPUTE_SOURCES)
+    add_slang_shader_target(
+            TARGET compile-slang-compute
+            SOURCES ${SHADER_SLANG_COMPUTE_SOURCES}
+            ENTRY_POINTS -entry compMain
+    )
+endif ()
+
 add_executable(pngp-vis-rays)
 target_sources(pngp-vis-rays
         PRIVATE
@@ -91,6 +107,10 @@ target_sources(pngp-vis-rays
         pngp.vis.rays.ixx
         pngp.vis.rays.record.ixx
         pngp.vis.rays.playback.ixx
+        pngp.vis.rays.filter.ixx
 )
 target_link_libraries(pngp-vis-rays PRIVATE vk-core::vk-core)
 add_dependencies(pngp-vis-rays compile-slang-shaders)
+if (TARGET compile-slang-compute)
+    add_dependencies(pngp-vis-rays compile-slang-compute)
+endif ()

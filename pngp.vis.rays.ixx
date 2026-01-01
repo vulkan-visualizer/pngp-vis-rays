@@ -11,6 +11,9 @@ import vk.pipeline;
 import vk.memory;
 import vk.geometry;
 import vk.math;
+import pngp.vis.rays.record;
+import pngp.vis.rays.playback;
+import pngp.vis.rays.filter;
 import std;
 
 namespace pngp::vis::rays {
@@ -64,6 +67,17 @@ namespace pngp::vis::rays {
         bool enable_viewports = true;
     };
 
+    // ========================================================================
+    // Ray rendering + filter settings.
+    // ========================================================================
+    struct RaySettings {
+        bool show_rays = true;
+        float line_length = 5.0f;
+        float opacity     = 0.7f;
+        std::uint32_t stride   = 1;
+        std::uint32_t max_rays = 250000;
+    };
+
     export struct RaysInspectorInfo {
         ViewerRenderConfig render{};
     };
@@ -114,6 +128,38 @@ namespace pngp::vis::rays {
         vk::pipeline::GraphicsPipeline grid_pipeline;
         vk::memory::MeshGPU grid_mesh;
         vk::math::mat4 grid_mvp{};
+        // ====================================================================
+        // Ray playback + GPU resources.
+        // ====================================================================
+        playback::RayPlayback playback{};
+        record::FrameHeader active_frame{};
+        std::size_t active_frame_index = 0;
+
+        playback::RayBufferGPU ray_input{};
+        vk::memory::Buffer ray_filtered{};
+        vk::memory::Buffer ray_count{};
+        vk::memory::Buffer ray_indirect{};
+        std::uint32_t ray_capacity = 0;
+
+        filter::FilterPipeline filter_pipeline{};
+        filter::FilterBindings filter_bindings{};
+        filter::IndirectPipeline indirect_pipeline{};
+        filter::IndirectBindings indirect_bindings{};
+
+        vk::raii::DescriptorSetLayout ray_set_layout{nullptr};
+        vk::raii::DescriptorPool ray_pool{nullptr};
+        vk::raii::DescriptorSet ray_set{nullptr};
+        vk::pipeline::GraphicsPipeline ray_pipeline;
+        // ====================================================================
+        // UI + playback state.
+        // ====================================================================
+        RaySettings rays{};
+        std::array<char, 512> record_path_buf{};
+        std::string record_error{};
+        bool request_open_record  = false;
+        bool request_close_record = false;
+        bool request_frame_upload = false;
+        bool request_ray_resize   = false;
         // ====================================================================
         // UI + input state.
         // ====================================================================
