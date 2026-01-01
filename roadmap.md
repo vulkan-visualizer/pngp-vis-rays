@@ -7,10 +7,10 @@ Deliver a ray-centric debug tool with rich per-sample data, extensible attribute
 streams, and GPU-based filtering/compaction for interactive inspection.
 
 Current Baseline (Implemented)
-- v1 record schema + loader + GPU playback.
+- v2 record schema + reader + GPU playback.
 - Instanced indirect ray rendering.
 - GPU filter with stride/max rays + cached recompute.
-- Independent CUDA ray generator (v1 output).
+- Independent CUDA ray generator (v2 output).
 
 ---------------------------------------------------------------------
 Milestone 0: Finalize v2 Schema (Design + Spec)

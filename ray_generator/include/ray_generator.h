@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "record_schema.h"
+#include "record_schema_v2.h"
 
 namespace raygen {
     struct CameraTransform {
@@ -23,5 +23,5 @@ namespace raygen {
         CameraTransform c2w{};
     };
 
-    void generate_rays_cuda(std::vector<record::RayRecord>& out, const RayGenConfig& cfg);
+    void generate_rays_cuda(std::vector<record_v2::RayBaseRecordV2>& out, const RayGenConfig& cfg);
 } // namespace raygen

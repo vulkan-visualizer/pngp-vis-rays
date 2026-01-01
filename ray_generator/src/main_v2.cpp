@@ -349,17 +349,14 @@ int main(int argc, char** argv) {
         cfg.cy = opt.cy;
         cfg.c2w = c2w;
 
-        std::vector<raygen::record::RayRecord> rays_frame;
-        raygen::generate_rays_cuda(rays_frame, cfg);
-
         std::vector<raygen::record_v2::RayBaseRecordV2> rays;
+        raygen::generate_rays_cuda(rays, cfg);
         std::vector<raygen::record_v2::SampleRecordV2> samples;
         std::vector<raygen::record_v2::SampleEvalV2> evals;
         std::vector<raygen::record_v2::RayResultV2> results;
 
-        const std::size_t ray_count = rays_frame.size();
+        const std::size_t ray_count = rays.size();
         const std::size_t sample_count = ray_count * opt.samples_per_ray;
-        rays.resize(ray_count);
         samples.resize(sample_count);
         evals.resize(sample_count);
         results.resize(ray_count);
@@ -368,16 +365,7 @@ int main(int argc, char** argv) {
         const float dt = opt.max_depth / static_cast<float>(opt.samples_per_ray);
 
         for (std::size_t r = 0; r < ray_count; ++r) {
-            const auto& src = rays_frame[r];
             auto& dst = rays[r];
-            dst.ox = src.ox;
-            dst.oy = src.oy;
-            dst.oz = src.oz;
-            dst.dx = src.dx;
-            dst.dy = src.dy;
-            dst.dz = src.dz;
-            dst.pixel_x = src.pixel_x;
-            dst.pixel_y = src.pixel_y;
             dst.ray_flags = 1;
             dst.sample_offset = static_cast<std::uint32_t>(r * opt.samples_per_ray);
             dst.sample_count  = opt.samples_per_ray;

@@ -11,9 +11,7 @@ import vk.pipeline;
 import vk.memory;
 import vk.geometry;
 import vk.math;
-import pngp.vis.rays.record;
 import pngp.vis.rays.record_v2;
-import pngp.vis.rays.playback;
 import pngp.vis.rays.filter;
 import std;
 
@@ -133,6 +131,14 @@ namespace pngp::vis::rays {
         float contrib_scale = 1.0f;
     };
 
+    // ========================================================================
+    // GPU buffer wrapper for ray payloads.
+    // ========================================================================
+    struct RayBufferGPU {
+        vk::memory::Buffer buffer{};
+        std::uint64_t count{};
+    };
+
     export struct RaysInspectorInfo {
         ViewerRenderConfig render{};
     };
@@ -184,21 +190,18 @@ namespace pngp::vis::rays {
         vk::memory::MeshGPU grid_mesh;
         vk::math::mat4 grid_mvp{};
         // ====================================================================
-        // Ray playback + GPU resources.
+        // Ray record + GPU resources.
         // ====================================================================
-        playback::RayPlayback playback{};
-        record::FrameHeader active_frame{};
         std::size_t active_frame_index = 0;
         record_v2::RecordReaderV2 record_v2_reader{};
         record_v2::FrameViewV2 v2_view{};
         record_v2::FrameIndexEntryV2 active_frame_v2{};
-        bool record_v2_active = false;
         int v2_ray_index = 0;
         int v2_sample_index = 0;
         int v2_mask_attr_index = -1;
         int v2_batch_attr_index = -1;
 
-        playback::RayBufferGPU ray_input{};
+        RayBufferGPU ray_input{};
         vk::memory::Buffer ray_filtered{};
         vk::memory::Buffer ray_count{};
         vk::memory::Buffer ray_indirect{};
@@ -220,8 +223,6 @@ namespace pngp::vis::rays {
         vk::raii::DescriptorPool ray_pool{nullptr};
         vk::raii::DescriptorSet ray_set{nullptr};
         vk::pipeline::GraphicsPipeline ray_pipeline;
-        vk::pipeline::GraphicsPipeline ray_pipeline_v2;
-        filter::FilterPipeline filter_pipeline_v2{};
 
         vk::raii::DescriptorSetLayout sample_set_layout{nullptr};
         vk::raii::DescriptorPool sample_pool{nullptr};
@@ -232,7 +233,7 @@ namespace pngp::vis::rays {
         vk::raii::DescriptorPool v2_attribute_pool{nullptr};
         std::vector<vk::raii::DescriptorSet> v2_attribute_sets{};
         // ====================================================================
-        // UI + playback state.
+        // UI + record state.
         // ====================================================================
         RaySettings rays{};
         SampleSettings samples{};

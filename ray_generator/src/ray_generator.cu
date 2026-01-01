@@ -10,7 +10,7 @@
 namespace raygen {
     namespace {
         struct DeviceBuffer {
-            record::RayRecord* ptr{};
+            record_v2::RayBaseRecordV2* ptr{};
             ~DeviceBuffer() {
                 if (ptr) cudaFree(ptr);
             }
@@ -28,7 +28,7 @@ namespace raygen {
             return make_float3(v.x / len, v.y / len, v.z / len);
         }
 
-        __global__ void generate_kernel(record::RayRecord* out, const RayGenConfig cfg) {
+        __global__ void generate_kernel(record_v2::RayBaseRecordV2* out, const RayGenConfig cfg) {
             const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
             const std::uint32_t total = cfg.width * cfg.height;
             if (idx >= total) return;
@@ -47,7 +47,7 @@ namespace raygen {
 
             const float3 origin = make_float3(cfg.c2w.c2w[3], cfg.c2w.c2w[7], cfg.c2w.c2w[11]);
 
-            record::RayRecord r{};
+            record_v2::RayBaseRecordV2 r{};
             r.ox = origin.x;
             r.oy = origin.y;
             r.oz = origin.z;
@@ -56,20 +56,20 @@ namespace raygen {
             r.dz = dir_world.z;
             r.pixel_x = px;
             r.pixel_y = py;
-            r.flags   = 0;
+            r.ray_flags   = 0;
 
             out[idx] = r;
         }
     } // namespace
 
-    void generate_rays_cuda(std::vector<record::RayRecord>& out, const RayGenConfig& cfg) {
+    void generate_rays_cuda(std::vector<record_v2::RayBaseRecordV2>& out, const RayGenConfig& cfg) {
         const std::size_t count = static_cast<std::size_t>(cfg.width) * cfg.height;
         out.clear();
         if (count == 0) return;
         out.resize(count);
 
         DeviceBuffer device{};
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&device.ptr), count * sizeof(record::RayRecord)),
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&device.ptr), count * sizeof(record_v2::RayBaseRecordV2)),
                    "cudaMalloc rays");
 
         const dim3 block(256);
@@ -78,7 +78,7 @@ namespace raygen {
         cuda_check(cudaGetLastError(), "generate_kernel launch");
         cuda_check(cudaDeviceSynchronize(), "generate_kernel sync");
 
-        cuda_check(cudaMemcpy(out.data(), device.ptr, count * sizeof(record::RayRecord),
+        cuda_check(cudaMemcpy(out.data(), device.ptr, count * sizeof(record_v2::RayBaseRecordV2),
                               cudaMemcpyDeviceToHost),
                    "cudaMemcpy rays");
     }

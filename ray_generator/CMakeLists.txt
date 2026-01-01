@@ -16,14 +16,6 @@ set(CMAKE_CUDA_EXTENSIONS ON)
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 set(CMAKE_CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
-add_executable(ray_generator
-        src/main.cpp
-        src/ray_generator.cu
-)
-
-target_include_directories(ray_generator PRIVATE include)
-set_target_properties(ray_generator PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-
 add_executable(ray_generator_v2
         src/main_v2.cpp
         src/ray_generator.cu

@@ -8,7 +8,6 @@ import std;
 import vk.context;
 import vk.pipeline;
 import vk.memory;
-import pngp.vis.rays.record;
 
 namespace {
     // ========================================================================
@@ -81,7 +80,7 @@ namespace pngp::vis::rays::filter {
     // ========================================================================
     // Pipeline + descriptor setup.
     // ========================================================================
-    export [[nodiscard]] FilterPipeline create_filter_pipeline_from_paths(
+    [[nodiscard]] FilterPipeline create_filter_pipeline_from_paths_(
         const vk::raii::Device& device,
         std::span<const char* const> paths) {
         const vk::DescriptorSetLayoutBinding bindings[] = {
@@ -164,13 +163,12 @@ namespace pngp::vis::rays::filter {
         return out;
     }
 
-    export [[nodiscard]] FilterPipeline create_filter_pipeline(const vk::raii::Device& device,
-                                                              const vk::Format) {
+    export [[nodiscard]] FilterPipeline create_filter_pipeline(const vk::raii::Device& device) {
         constexpr std::array paths{
-            "../shaders/ray_filter.spv",
-            "../shaders/ray_filter.spv",
+            "shaders/compute/ray_filter_v2.spv",
+            "../shaders/compute/ray_filter_v2.spv",
         };
-        return create_filter_pipeline_from_paths(device, paths);
+        return create_filter_pipeline_from_paths_(device, paths);
     }
 
     export [[nodiscard]] FilterBindings create_filter_bindings(const vk::raii::Device& device) {

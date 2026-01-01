@@ -12,9 +12,7 @@ import vk.pipeline;
 import vk.memory;
 import vk.geometry;
 import vk.math;
-import pngp.vis.rays.record;
 import pngp.vis.rays.record_v2;
-import pngp.vis.rays.playback;
 import pngp.vis.rays.filter;
 
 // ============================================================================
@@ -87,7 +85,7 @@ namespace {
     };
 
     // =========================================================================
-    // Push constants consumed by ray_lines.slang.
+    // Push constants consumed by ray_lines_v2.slang.
     // =========================================================================
     struct RayPush {
         vk::math::mat4 mvp{};
@@ -508,14 +506,7 @@ namespace {
     vk::pipeline::GraphicsPipeline create_ray_pipeline(const vk::context::VulkanContext& vkctx,
                                                        const vk::swapchain::Swapchain& sc,
                                                        const vk::raii::DescriptorSetLayout& set_layout) {
-        constexpr std::array paths{"../shaders/ray_lines.spv", "../shaders/ray_lines.spv"};
-        return create_ray_pipeline_with_paths(vkctx, sc, set_layout, paths);
-    }
-
-    vk::pipeline::GraphicsPipeline create_ray_pipeline_v2(const vk::context::VulkanContext& vkctx,
-                                                          const vk::swapchain::Swapchain& sc,
-                                                          const vk::raii::DescriptorSetLayout& set_layout) {
-        constexpr std::array paths{"../shaders/ray_lines_v2.spv", "../shaders/ray_lines_v2.spv"};
+        constexpr std::array paths{"shaders/ray_lines_v2.spv", "../shaders/ray_lines_v2.spv"};
         return create_ray_pipeline_with_paths(vkctx, sc, set_layout, paths);
     }
 
@@ -714,7 +705,6 @@ void pngp::vis::rays::RaysInspector::run() {
             ctx.device.waitIdle();
             grid_pipeline = create_grid_pipeline(ctx, swapchain);
             ray_pipeline  = create_ray_pipeline(ctx, swapchain, ray_set_layout);
-            ray_pipeline_v2 = create_ray_pipeline_v2(ctx, swapchain, ray_set_layout);
             sample_pipeline = create_sample_pipeline(ctx, swapchain, sample_set_layout);
             continue;
         }
@@ -736,14 +726,12 @@ void pngp::vis::rays::RaysInspector::run() {
         }
 
         // ====================================================================
-        // Handle playback requests and GPU buffer updates.
+        // Handle record requests and GPU buffer updates.
         // ====================================================================
         if (request_close_record) {
             request_close_record = false;
             ctx.device.waitIdle();
-            playback.close();
             record_v2_reader.close();
-            record_v2_active = false;
             v2_view = {};
             active_frame_v2 = {};
             v2_mask_attr_index = -1;
@@ -761,7 +749,6 @@ void pngp::vis::rays::RaysInspector::run() {
             v2_attribute_pool = vk::raii::DescriptorPool{nullptr};
             v2_attribute_capacity = 0;
             rays.roi_initialized = false;
-            active_frame  = {};
             record_error.clear();
         }
 
@@ -772,13 +759,10 @@ void pngp::vis::rays::RaysInspector::run() {
                 record_error = "Record path is empty.";
             } else {
                 try {
-                    playback.close();
                     record_v2_reader.close();
-                    record_v2_active = false;
 
                     if (record_v2::is_v2_file(record_path_buf.data())) {
                         record_v2_reader.open(record_path_buf.data());
-                        record_v2_active = true;
                         v2_mask_attr_index = -1;
                         v2_batch_attr_index = -1;
                         ray_input     = {};
@@ -795,8 +779,7 @@ void pngp::vis::rays::RaysInspector::run() {
                         v2_attribute_capacity = 0;
                         rays.roi_initialized = false;
                     } else {
-                        playback.open(record_path_buf.data());
-                        rays.roi_initialized = false;
+                        record_error = "Unsupported record format (expected v2).";
                     }
 
                     active_frame_index = 0;
@@ -804,16 +787,14 @@ void pngp::vis::rays::RaysInspector::run() {
                     filter_dirty = true;
                 } catch (const std::exception& e) {
                     record_error = e.what();
-                    playback.close();
                     record_v2_reader.close();
-                    record_v2_active = false;
                 }
             }
         }
 
         if (request_frame_upload) {
             request_frame_upload = false;
-            if (record_v2_active && record_v2_reader.is_open()) {
+            if (record_v2_reader.is_open()) {
                 v2_view = record_v2_reader.frame_view(active_frame_index);
                 active_frame_v2 = v2_view.header;
                 v2_ray_index = 0;
@@ -832,7 +813,7 @@ void pngp::vis::rays::RaysInspector::run() {
                     auto buffer = vk::memory::upload_to_device_local_buffer(
                         ctx.physical_device, ctx.device, ctx.command_pool, ctx.graphics_queue, bytes,
                         vk::BufferUsageFlagBits::eStorageBuffer);
-                    ray_input = playback::RayBufferGPU{std::move(buffer), static_cast<std::uint64_t>(v2_view.rays.size())};
+                    ray_input = RayBufferGPU{std::move(buffer), static_cast<std::uint64_t>(v2_view.rays.size())};
                 }
 
                 v2_samples = upload_storage_buffer(ctx, std::as_bytes(v2_view.samples));
@@ -875,24 +856,6 @@ void pngp::vis::rays::RaysInspector::run() {
                     filter::update_indirect_set(ctx.device, indirect_bindings, ray_count, ray_indirect);
                     filter_dirty = true;
                 }
-            } else if (playback.is_open()) {
-                ctx.device.waitIdle();
-                const auto frame = playback.load_frame(active_frame_index);
-                active_frame = frame.header;
-                ray_input = playback.upload_rays(ctx, frame.rays);
-
-                const auto in_count_u64 = std::min<std::uint64_t>(ray_input.count, std::numeric_limits<std::uint32_t>::max());
-                const auto in_count = static_cast<std::uint32_t>(in_count_u64);
-                if (in_count > 0) {
-                    const std::uint32_t desired = std::min(rays.max_rays, in_count);
-                    ensure_ray_buffers(ctx, desired, sizeof(record::RayRecord),
-                                       ray_filtered, ray_count, ray_indirect, ray_capacity);
-                    filter::update_filter_set(ctx.device, filter_bindings, ray_input.buffer, ray_filtered, ray_count,
-                                              dummy_storage, dummy_storage, dummy_storage);
-                    update_ray_set(ctx.device, ray_set, ray_filtered, dummy_storage, dummy_storage, dummy_storage);
-                    filter::update_indirect_set(ctx.device, indirect_bindings, ray_count, ray_indirect);
-                    filter_dirty = true;
-                }
             }
         }
 
@@ -904,20 +867,17 @@ void pngp::vis::rays::RaysInspector::run() {
                 const std::uint32_t desired = std::min(rays.max_rays, in_count);
                 if (desired > ray_capacity) {
                     ctx.device.waitIdle();
-                    const std::size_t element_bytes = record_v2_active
-                                                          ? sizeof(record_v2::RayBaseRecordV2)
-                                                          : sizeof(record::RayRecord);
-                    ensure_ray_buffers(ctx, desired, element_bytes,
+                    ensure_ray_buffers(ctx, desired, sizeof(record_v2::RayBaseRecordV2),
                                        ray_filtered, ray_count, ray_indirect, ray_capacity);
-                    const auto& sample_buf = record_v2_active && v2_samples.size > 0 ? v2_samples : dummy_storage;
-                    const auto& result_buf = record_v2_active && v2_results.size > 0 ? v2_results : dummy_storage;
+                    const auto& sample_buf = v2_samples.size > 0 ? v2_samples : dummy_storage;
+                    const auto& result_buf = v2_results.size > 0 ? v2_results : dummy_storage;
                     const auto& mask_buf =
-                        (record_v2_active && v2_mask_attr_index >= 0 &&
+                        (v2_mask_attr_index >= 0 &&
                          static_cast<std::size_t>(v2_mask_attr_index) < v2_attribute_buffers.size())
                             ? v2_attribute_buffers[static_cast<std::size_t>(v2_mask_attr_index)]
                             : dummy_storage;
                     const auto& batch_buf =
-                        (record_v2_active && v2_batch_attr_index >= 0 &&
+                        (v2_batch_attr_index >= 0 &&
                          static_cast<std::size_t>(v2_batch_attr_index) < v2_attribute_buffers.size())
                             ? v2_attribute_buffers[static_cast<std::size_t>(v2_batch_attr_index)]
                             : dummy_storage;
@@ -996,7 +956,6 @@ void pngp::vis::rays::RaysInspector::run() {
             ctx.device.waitIdle();
             grid_pipeline = create_grid_pipeline(ctx, swapchain);
             ray_pipeline  = create_ray_pipeline(ctx, swapchain, ray_set_layout);
-            ray_pipeline_v2 = create_ray_pipeline_v2(ctx, swapchain, ray_set_layout);
             sample_pipeline = create_sample_pipeline(ctx, swapchain, sample_set_layout);
         }
 
@@ -1058,7 +1017,6 @@ pngp::vis::rays::RaysInspector::RaysInspector(const RaysInspectorInfo& info) {
     ray_pool         = create_ray_pool(ctx.device);
     ray_set          = allocate_ray_set(ctx.device, ray_pool, ray_set_layout);
     ray_pipeline     = create_ray_pipeline(ctx, swapchain, ray_set_layout);
-    ray_pipeline_v2  = create_ray_pipeline_v2(ctx, swapchain, ray_set_layout);
     v2_attribute_set_layout = create_attribute_set_layout(ctx.device);
     sample_set_layout = create_sample_set_layout(ctx.device);
     sample_pool       = create_sample_pool(ctx.device);
@@ -1069,14 +1027,7 @@ pngp::vis::rays::RaysInspector::RaysInspector(const RaysInspectorInfo& info) {
         dummy_storage = upload_storage_buffer_non_empty(ctx, zeros);
     }
 
-    filter_pipeline  = filter::create_filter_pipeline(ctx.device, swapchain.format);
-    {
-        constexpr std::array paths{
-            "../shaders/ray_filter_v2.spv",
-            "../shaders/ray_filter_v2.spv",
-        };
-        filter_pipeline_v2 = filter::create_filter_pipeline_from_paths(ctx.device, paths);
-    }
+    filter_pipeline  = filter::create_filter_pipeline(ctx.device);
     filter_bindings  = filter::create_filter_bindings(ctx.device);
     filter::allocate_filter_set(ctx.device, filter_pipeline, filter_bindings);
 
@@ -1166,7 +1117,7 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
         };
         cmd.pipelineBarrier2(clear_dep);
 
-        const auto& filter_pipe = record_v2_active ? filter_pipeline_v2 : filter_pipeline;
+        const auto& filter_pipe = filter_pipeline;
         filter::FilterParams params{};
         params.in_count = in_count;
         params.stride   = ray_stride;
@@ -1177,10 +1128,8 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
         params.mask_id  = rays.mask_id;
         params.batch_id = rays.batch_id;
 
-        const std::uint32_t frame_width =
-            record_v2_active ? active_frame_v2.width : active_frame.width;
-        const std::uint32_t frame_height =
-            record_v2_active ? active_frame_v2.height : active_frame.height;
+        const std::uint32_t frame_width = active_frame_v2.width;
+        const std::uint32_t frame_height = active_frame_v2.height;
         const int max_x = frame_width > 0 ? static_cast<int>(frame_width - 1) : 0;
         const int max_y = frame_height > 0 ? static_cast<int>(frame_height - 1) : 0;
         int roi_min_x = std::clamp(rays.roi_min_x, 0, max_x);
@@ -1197,15 +1146,15 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
         if (rays.roi_enabled && frame_width > 0 && frame_height > 0) {
             params.flags |= k_filter_roi;
         }
-        if (record_v2_active && (rays.filter_sample_state || rays.filter_omit_reason) && v2_samples.size > 0) {
+        if ((rays.filter_sample_state || rays.filter_omit_reason) && v2_samples.size > 0) {
             params.flags |= k_filter_sample;
             params.sample_state_mask = rays.filter_sample_state ? rays.sample_state_mask : 0u;
             params.omit_reason_mask  = rays.filter_omit_reason ? rays.omit_reason_mask : 0u;
         }
-        if (record_v2_active && rays.filter_mask_id && v2_mask_attr_index >= 0) {
+        if (rays.filter_mask_id && v2_mask_attr_index >= 0) {
             params.flags |= k_filter_mask_id;
         }
-        if (record_v2_active && rays.filter_batch_id && v2_batch_attr_index >= 0) {
+        if (rays.filter_batch_id && v2_batch_attr_index >= 0) {
             params.flags |= k_filter_batch_id;
         }
         const std::uint32_t group_count = (in_count + 255u) / 256u;
@@ -1325,12 +1274,11 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
     // Ray draw: compacted line list + indirect draw.
     // ========================================================================
     if (can_dispatch && ray_max_out > 0) {
-        const auto& ray_pipe = record_v2_active ? ray_pipeline_v2 : ray_pipeline;
-        cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *ray_pipe.pipeline);
-        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *ray_pipe.layout, 0, {*ray_set}, {});
+        cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *ray_pipeline.pipeline);
+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *ray_pipeline.layout, 0, {*ray_set}, {});
 
         const RayPush push = make_ray_push(rays, grid_mvp);
-        cmd.pushConstants(*ray_pipe.layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+        cmd.pushConstants(*ray_pipeline.layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
                           vk::ArrayProxy<const RayPush>{push});
         cmd.drawIndirect(*ray_indirect.buffer, 0, 1, sizeof(vk::DrawIndirectCommand));
     }
@@ -1338,7 +1286,7 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
     // ========================================================================
     // Sample draw: v2 sample points (no compaction yet).
     // ========================================================================
-    if (record_v2_active && samples.show_samples && v2_samples.size > 0) {
+    if (record_v2_reader.is_open() && samples.show_samples && v2_samples.size > 0) {
         const auto sample_count_u64 = std::min<std::uint64_t>(active_frame_v2.sample_count,
                                                              std::numeric_limits<std::uint32_t>::max());
         const auto max_samples = std::max(1u, samples.max_samples);
@@ -1408,16 +1356,15 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
     ImGui::TextUnformatted("Fly: RMB look + WASD move, Q/E down/up");
 
     ImGui::Separator();
-    ImGui::TextUnformatted("Ray Playback");
+    ImGui::TextUnformatted("Ray Record");
     ImGui::InputText("Record path", record_path_buf.data(), record_path_buf.size());
     if (ImGui::Button("Open")) request_open_record = true;
     ImGui::SameLine();
     if (ImGui::Button("Close")) request_close_record = true;
     if (!record_error.empty()) ImGui::TextWrapped("%s", record_error.c_str());
 
-    if (record_v2_active && record_v2_reader.is_open()) {
+    if (record_v2_reader.is_open()) {
         const auto total_frames = record_v2_reader.frame_count();
-        ImGui::TextUnformatted("Format: v2");
         ImGui::Text("Frames: %zu", total_frames);
         if (total_frames > 0) {
             int frame = static_cast<int>(active_frame_index);
@@ -1429,22 +1376,9 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
             ImGui::Text("Rays: %llu", static_cast<unsigned long long>(active_frame_v2.ray_count));
             ImGui::Text("Samples: %llu", static_cast<unsigned long long>(active_frame_v2.sample_count));
         }
-    } else if (playback.is_open()) {
-        const auto total_frames = playback.frame_count();
-        ImGui::TextUnformatted("Format: v1");
-        ImGui::Text("Frames: %zu", total_frames);
-        if (total_frames > 0) {
-            int frame = static_cast<int>(active_frame_index);
-            const int max_frame = static_cast<int>(total_frames - 1);
-            if (ImGui::SliderInt("Frame", &frame, 0, max_frame)) {
-                active_frame_index = static_cast<std::size_t>(frame);
-                request_frame_upload = true;
-            }
-            ImGui::Text("Rays: %llu", static_cast<unsigned long long>(active_frame.ray_count));
-        }
     }
 
-    if (record_v2_active && record_v2_reader.is_open() && !v2_view.rays.empty()) {
+    if (record_v2_reader.is_open() && !v2_view.rays.empty()) {
         ImGui::Separator();
         ImGui::TextUnformatted("v2 CPU Inspection");
 
@@ -1527,15 +1461,10 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
         }
     }
 
-    const bool have_frame = (record_v2_active && record_v2_reader.is_open())
-                                ? (active_frame_v2.width > 0 && active_frame_v2.height > 0)
-                                : (playback.is_open() && active_frame.width > 0 && active_frame.height > 0);
-    const int max_x = have_frame
-                          ? static_cast<int>((record_v2_active ? active_frame_v2.width : active_frame.width) - 1)
-                          : 0;
-    const int max_y = have_frame
-                          ? static_cast<int>((record_v2_active ? active_frame_v2.height : active_frame.height) - 1)
-                          : 0;
+    const bool have_frame =
+        record_v2_reader.is_open() && active_frame_v2.width > 0 && active_frame_v2.height > 0;
+    const int max_x = have_frame ? static_cast<int>(active_frame_v2.width - 1) : 0;
+    const int max_y = have_frame ? static_cast<int>(active_frame_v2.height - 1) : 0;
 
     if (!rays.roi_initialized && have_frame) {
         rays.roi_min_x = 0;
@@ -1566,7 +1495,7 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
     }
 
     const bool v2_sample_available =
-        record_v2_active && record_v2_reader.is_open() && !v2_view.samples.empty();
+        record_v2_reader.is_open() && !v2_view.samples.empty();
     ImGui::BeginDisabled(!v2_sample_available);
     if (ImGui::Checkbox("Filter sample state", &rays.filter_sample_state)) {
         filter_dirty = true;
@@ -1622,8 +1551,8 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
     }
     ImGui::EndDisabled();
 
-    const bool has_mask_attr = record_v2_active && v2_mask_attr_index >= 0;
-    const bool has_batch_attr = record_v2_active && v2_batch_attr_index >= 0;
+    const bool has_mask_attr = record_v2_reader.is_open() && v2_mask_attr_index >= 0;
+    const bool has_batch_attr = record_v2_reader.is_open() && v2_batch_attr_index >= 0;
     ImGui::BeginDisabled(!has_mask_attr);
     if (ImGui::Checkbox("Filter mask id", &rays.filter_mask_id)) {
         filter_dirty = true;
@@ -1652,7 +1581,7 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
 
     ImGui::Separator();
     ImGui::TextUnformatted("Sample Visualization (v2)");
-    ImGui::BeginDisabled(!(record_v2_active && record_v2_reader.is_open()));
+    ImGui::BeginDisabled(!record_v2_reader.is_open());
     ImGui::Checkbox("Show samples", &samples.show_samples);
     ImGui::SliderFloat("Point size", &samples.point_size, 0.5f, 10.0f);
     {
