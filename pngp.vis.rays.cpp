@@ -58,104 +58,34 @@ namespace {
         s->scroll += float(yoff);
     }
 
-    struct LineMeshCPU {
-        std::vector<vk::geometry::VertexP3C4> vertices;
-        std::vector<std::uint32_t> indices;
+    struct GridPushConstants {
+        vk::math::mat4 mvp{};
+        vk::math::vec4 params0{};
+        vk::math::vec4 params1{};
     };
 
-    void push_line(LineMeshCPU& mesh, const vk::math::vec3& a, const vk::math::vec3& b,
-                   const vk::math::vec4& color) {
-        const std::uint32_t base = static_cast<std::uint32_t>(mesh.vertices.size());
-        mesh.vertices.push_back({a, color});
-        mesh.vertices.push_back({b, color});
-        mesh.indices.push_back(base + 0);
-        mesh.indices.push_back(base + 1);
-    }
-
-    vk::math::vec4 scale_rgb(vk::math::vec4 c, float s) {
-        return {c.x * s, c.y * s, c.z * s, c.w};
-    }
-
-    LineMeshCPU build_ground_lines(const GridSettings& grid) {
-        LineMeshCPU mesh{};
-
+    vk::memory::MeshCPU<vk::geometry::VertexP3C4> build_ground_plane(const GridSettings& grid) {
+        vk::memory::MeshCPU<vk::geometry::VertexP3C4> mesh{};
         const float extent = std::max(0.1f, grid.grid_extent);
-        const float step   = std::max(0.01f, grid.grid_step);
-        const int half     = std::max(1, int(std::floor(extent / step)));
-        const float half_extent = float(half) * step;
+        const vk::math::vec4 color{1.0f, 1.0f, 1.0f, 1.0f};
 
-        const vk::math::vec4 grid_minor{0.18f, 0.18f, 0.19f, 1.0f};
-        const vk::math::vec4 grid_major{0.32f, 0.32f, 0.34f, 1.0f};
+        mesh.vertices = {
+            {{-extent, 0.0f, -extent, 0.0f}, color},
+            {{extent, 0.0f, -extent, 0.0f}, color},
+            {{extent, 0.0f, extent, 0.0f}, color},
+            {{-extent, 0.0f, extent, 0.0f}, color},
+        };
 
-        if (grid.show_grid) {
-            for (int i = -half; i <= half; ++i) {
-                const float pos = float(i) * step;
-                const float t = float(std::abs(i)) / float(half);
-                const float fade = std::clamp(1.0f - t * 0.6f, 0.35f, 1.0f);
-                const bool major = (grid.major_every > 0) && (i % grid.major_every == 0);
-                const vk::math::vec4 col = scale_rgb(major ? grid_major : grid_minor, fade);
-
-                push_line(mesh, vk::math::vec3{pos, 0.0f, -half_extent, 0.0f},
-                          vk::math::vec3{pos, 0.0f, half_extent, 0.0f}, col);
-                push_line(mesh, vk::math::vec3{-half_extent, 0.0f, pos, 0.0f},
-                          vk::math::vec3{half_extent, 0.0f, pos, 0.0f}, col);
-            }
-        }
-
-        if (grid.show_axes) {
-            const float len = std::max(step * 2.0f, grid.axis_length);
-
-            const vk::math::vec4 x_pos{0.90f, 0.15f, 0.15f, 1.0f};
-            const vk::math::vec4 x_neg{0.35f, 0.08f, 0.08f, 1.0f};
-            const vk::math::vec4 y_pos{0.15f, 0.90f, 0.15f, 1.0f};
-            const vk::math::vec4 y_neg{0.08f, 0.35f, 0.08f, 1.0f};
-            const vk::math::vec4 z_pos{0.20f, 0.40f, 0.95f, 1.0f};
-            const vk::math::vec4 z_neg{0.08f, 0.18f, 0.40f, 1.0f};
-
-            push_line(mesh, vk::math::vec3{0.0f, 0.0f, 0.0f, 0.0f},
-                      vk::math::vec3{len, 0.0f, 0.0f, 0.0f}, x_pos);
-            push_line(mesh, vk::math::vec3{0.0f, 0.0f, 0.0f, 0.0f},
-                      vk::math::vec3{-len, 0.0f, 0.0f, 0.0f}, x_neg);
-
-            push_line(mesh, vk::math::vec3{0.0f, 0.0f, 0.0f, 0.0f},
-                      vk::math::vec3{0.0f, len, 0.0f, 0.0f}, y_pos);
-            push_line(mesh, vk::math::vec3{0.0f, 0.0f, 0.0f, 0.0f},
-                      vk::math::vec3{0.0f, -len, 0.0f, 0.0f}, y_neg);
-
-            push_line(mesh, vk::math::vec3{0.0f, 0.0f, 0.0f, 0.0f},
-                      vk::math::vec3{0.0f, 0.0f, len, 0.0f}, z_pos);
-            push_line(mesh, vk::math::vec3{0.0f, 0.0f, 0.0f, 0.0f},
-                      vk::math::vec3{0.0f, 0.0f, -len, 0.0f}, z_neg);
-        }
-
-        if (grid.show_origin) {
-            const float o = std::max(0.02f, grid.origin_scale);
-            const vk::math::vec4 white{0.9f, 0.9f, 0.9f, 1.0f};
-
-            push_line(mesh, vk::math::vec3{-o, 0.0f, -o, 0.0f}, vk::math::vec3{o, 0.0f, o, 0.0f},
-                      white);
-            push_line(mesh, vk::math::vec3{-o, 0.0f, o, 0.0f}, vk::math::vec3{o, 0.0f, -o, 0.0f},
-                      white);
-            push_line(mesh, vk::math::vec3{-o, 0.0f, -o, 0.0f}, vk::math::vec3{o, 0.0f, -o, 0.0f},
-                      white);
-            push_line(mesh, vk::math::vec3{o, 0.0f, -o, 0.0f}, vk::math::vec3{o, 0.0f, o, 0.0f}, white);
-            push_line(mesh, vk::math::vec3{o, 0.0f, o, 0.0f}, vk::math::vec3{-o, 0.0f, o, 0.0f},
-                      white);
-            push_line(mesh, vk::math::vec3{-o, 0.0f, o, 0.0f}, vk::math::vec3{-o, 0.0f, -o, 0.0f},
-                      white);
-        }
-
+        mesh.indices = {0, 1, 2, 0, 2, 3};
         return mesh;
     }
 
-    vk::memory::MeshGPU upload_lines(const vk::context::VulkanContext& vkctx, const LineMeshCPU& mesh) {
+    vk::memory::MeshGPU upload_mesh_safe(
+        const vk::context::VulkanContext& vkctx,
+        const vk::memory::MeshCPU<vk::geometry::VertexP3C4>& mesh) {
         if (mesh.vertices.empty() || mesh.indices.empty()) return {};
-
-        vk::memory::MeshCPU<vk::geometry::VertexP3C4> cpu{};
-        cpu.vertices = mesh.vertices;
-        cpu.indices  = mesh.indices;
         return vk::memory::upload_mesh(vkctx.physical_device, vkctx.device, vkctx.command_pool,
-                                       vkctx.graphics_queue, cpu);
+                                       vkctx.graphics_queue, mesh);
     }
 
     std::vector<std::byte> read_shader_bytes(const char* primary, const char* fallback) {
@@ -178,10 +108,11 @@ namespace {
         desc.use_depth            = true;
         desc.cull                 = vk::CullModeFlagBits::eNone;
         desc.front_face           = vk::FrontFace::eCounterClockwise;
-        desc.polygon_mode         = vk::PolygonMode::eLine;
-        desc.topology             = vk::PrimitiveTopology::eLineList;
-        desc.push_constant_bytes  = sizeof(vk::math::mat4);
-        desc.push_constant_stages = vk::ShaderStageFlagBits::eVertex;
+        desc.polygon_mode         = vk::PolygonMode::eFill;
+        desc.topology             = vk::PrimitiveTopology::eTriangleList;
+        desc.enable_blend         = true;
+        desc.push_constant_bytes  = sizeof(GridPushConstants);
+        desc.push_constant_stages = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
         return vk::pipeline::create_graphics_pipeline(vkctx.device, vin, desc, shader, "vertMain",
                                                       "fragMain");
     }
@@ -220,8 +151,8 @@ void pngp::vis::rays::RaysInspector::run() {
         const bool rebuild_mesh = imgui_panel();
         if (rebuild_mesh) {
             ctx.device.waitIdle();
-            const LineMeshCPU mesh_cpu = build_ground_lines(grid);
-            grid_mesh = upload_lines(ctx, mesh_cpu);
+            const auto mesh_cpu = build_ground_plane(grid);
+            grid_mesh = upload_mesh_safe(ctx, mesh_cpu);
         }
 
         cam.set_mode(grid.fly_mode ? vk::camera::Mode::Fly : vk::camera::Mode::Orbit);
@@ -302,8 +233,8 @@ pngp::vis::rays::RaysInspector::RaysInspector(const RaysInspectorInfo& info) {
         cam.set_state(st);
     }
 
-    const LineMeshCPU mesh_cpu = build_ground_lines(grid);
-    grid_mesh = upload_lines(ctx, mesh_cpu);
+    const auto mesh_cpu = build_ground_plane(grid);
+    grid_mesh = upload_mesh_safe(ctx, mesh_cpu);
     grid_pipeline = create_grid_pipeline(ctx, swapchain);
 }
 void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, std::uint32_t image_index) {
@@ -397,8 +328,19 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
     cmd.setScissor(0, {scissor});
     if (grid_mesh.index_count > 0) {
         cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *grid_pipeline.pipeline);
-        cmd.pushConstants(*grid_pipeline.layout, vk::ShaderStageFlagBits::eVertex, 0,
-                          vk::ArrayProxy<const vk::math::mat4>{grid_mvp});
+        const float step        = std::max(0.001f, grid.grid_step);
+        const float extent      = std::max(0.1f, grid.grid_extent);
+        const float major_every = static_cast<float>(std::max(1, grid.major_every));
+
+        GridPushConstants push{};
+        push.mvp     = grid_mvp;
+        push.params0 = {step, step * major_every, extent, std::max(0.001f, grid.axis_length)};
+        push.params1 = {std::max(0.001f, grid.origin_scale), grid.show_grid ? 1.0f : 0.0f,
+                        grid.show_axes ? 1.0f : 0.0f, grid.show_origin ? 1.0f : 0.0f};
+
+        cmd.pushConstants(*grid_pipeline.layout,
+                          vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+                          vk::ArrayProxy<const GridPushConstants>{push});
 
         vk::DeviceSize offset = 0;
         cmd.bindVertexBuffers(0, {*grid_mesh.vertex_buffer.buffer}, {offset});
