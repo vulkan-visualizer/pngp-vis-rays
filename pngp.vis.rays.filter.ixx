@@ -165,8 +165,17 @@ namespace pngp::vis::rays::filter {
 
     export [[nodiscard]] FilterPipeline create_filter_pipeline(const vk::raii::Device& device) {
         constexpr std::array paths{
-            "shaders/ray_filter_v2.spv",
             "../shaders/ray_filter_v2.spv",
+            "../shaders/ray_filter_v2.spv",
+        };
+        return create_filter_pipeline_from_paths_(device, paths);
+    }
+
+    export [[nodiscard]] FilterPipeline create_sample_filter_pipeline(
+        const vk::raii::Device& device) {
+        constexpr std::array paths{
+            "../shaders/sample_filter_v2.spv",
+            "../shaders/sample_filter_v2.spv",
         };
         return create_filter_pipeline_from_paths_(device, paths);
     }
@@ -275,10 +284,10 @@ namespace pngp::vis::rays::filter {
                           vk::ArrayProxy<const FilterParams>{params});
         cmd.dispatch(group_count, 1, 1);
     }
-    // ========================================================================
-    // Indirect draw emission (count -> VkDrawIndirectCommand).
-    // ========================================================================
-    export [[nodiscard]] IndirectPipeline create_indirect_pipeline(const vk::raii::Device& device) {
+
+    [[nodiscard]] IndirectPipeline create_indirect_pipeline_from_paths_(
+        const vk::raii::Device& device,
+        std::span<const char* const> paths) {
         const vk::DescriptorSetLayoutBinding bindings[] = {
             {
                 .binding         = 0,
@@ -309,7 +318,7 @@ namespace pngp::vis::rays::filter {
 
         out.layout = vk::raii::PipelineLayout{device, layout_ci};
 
-        const auto spv = vk::pipeline::read_file_bytes("../shaders/ray_indirect.spv");
+        const auto spv = read_spv_bytes(paths);
         const auto shader = vk::pipeline::load_shader_module(device, spv);
 
         const vk::PipelineShaderStageCreateInfo stage{
@@ -325,6 +334,25 @@ namespace pngp::vis::rays::filter {
 
         out.pipeline = vk::raii::Pipeline{device, nullptr, ci};
         return out;
+    }
+    // ========================================================================
+    // Indirect draw emission (count -> VkDrawIndirectCommand).
+    // ========================================================================
+    export [[nodiscard]] IndirectPipeline create_indirect_pipeline(const vk::raii::Device& device) {
+        constexpr std::array paths{
+            "../shaders/ray_indirect.spv",
+            "../shaders/ray_indirect.spv",
+        };
+        return create_indirect_pipeline_from_paths_(device, paths);
+    }
+
+    export [[nodiscard]] IndirectPipeline create_sample_indirect_pipeline(
+        const vk::raii::Device& device) {
+        constexpr std::array paths{
+            "../shaders/sample_indirect.spv",
+            "../shaders/sample_indirect.spv",
+        };
+        return create_indirect_pipeline_from_paths_(device, paths);
     }
 
     export [[nodiscard]] IndirectBindings create_indirect_bindings(const vk::raii::Device& device) {

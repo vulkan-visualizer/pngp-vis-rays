@@ -1,106 +1,83 @@
 # roadmap.md
 
-NeRF Ray Debugger - Roadmap (Path A: Full v2 Schema + GPU Scan Compaction)
-
+NeRF Ray Debugger - Roadmap (Path A: v2-Only + GPU-First Debug)
 Goal
 Deliver a ray-centric debug tool with rich per-sample data, extensible attribute
 streams, and GPU-based filtering/compaction for interactive inspection.
 
 Current Baseline (Implemented)
-- v2 record schema + reader + GPU playback.
-- Instanced indirect ray rendering.
-- GPU filter with stride/max rays + cached recompute.
-- Independent CUDA ray generator (v2 output).
+- v2-only record schema + reader + validator + CUDA generator.
+- GPU upload for rays, samples, evals, results, and attribute streams.
+- GPU ray filter (ROI/state/omit/mask/batch) + prefix-sum compaction + indirect draw.
+- Ray color modes (direction/flags/mask/batch/result/depth) + sample point visualization.
 
 ---------------------------------------------------------------------
-Milestone 0: Finalize v2 Schema (Design + Spec)
+Completed Milestones
 ---------------------------------------------------------------------
-- Define RecordHeaderV2, FrameIndexEntryV2, RayBaseRecordV2.
-- Define SampleRecordV2 + SampleEvalV2 + RayResultV2.
-- Define AttributeStreamDesc (target, format, stride, offset).
-- Decide omit/termination reason enums and string table layout.
-- Deliverable: `record_schema_v2.md` + binary layout reference tests.
+Milestone 0: Finalize v2 Schema (Design + Spec) - DONE
+- `record_schema_v2.md` and layout test.
+
+Milestone 1: v2 Writer + Validator (CPU) - DONE
+- `ray_generator_v2` + `record_validate_v2`.
+
+Milestone 2: v2 Reader + CPU Inspection - DONE
+- v2 reader + per-ray/sample inspection UI.
+
+Milestone 3: GPU Upload for v2 Streams - DONE
+- GPU buffers for rays/samples/evals/results + attribute streams.
+
+Milestone 4: GPU Filter + Prefix-Sum Compaction - DONE
+- Ray filtering + compacted indirect draw.
+
+Milestone 5: Rendering Modes for Debug Data - DONE
+- Ray color modes + v2 sample point visualization.
 
 ---------------------------------------------------------------------
-Milestone 1: v2 Writer + Validator (CPU)
+Milestone 6: GPU Sample Compaction + Indirect Draw (Next)
 ---------------------------------------------------------------------
-- Add v2 writer in ray_generator (or a new tool) with:
-  - Section table + string table emission.
-  - Per-frame sections for rays, samples, sample evals, results.
-  - Optional attribute streams (mask id, batch id, density, etc.).
-- Add a lightweight validator tool that checks offsets, alignment, counts.
-- Deliverable: `ray_record_v2.bin` + `record_validate.exe`.
+- Build sample filter kernel (state/omit/ROI by parent ray, optional masks).
+- Prefix-sum compaction of sample indices (avoid moving full structs).
+- Indirect draw for sample points using compacted index buffer.
+- Deliverable: sample visualization stays fast on large datasets.
 
 ---------------------------------------------------------------------
-Milestone 2: v2 Reader + CPU Inspection
+Milestone 7: Sample Visualization Upgrades
 ---------------------------------------------------------------------
-- Extend loader to detect v1 vs v2 and parse section tables.
-- Provide CPU accessors for:
-  - Rays, samples, sample evals, results.
-  - Attribute streams via typed views.
-- Add minimal UI panel to display per-ray + per-sample tables (CPU).
-- Deliverable: v2 file loads and data is visible in the UI.
+- Heatmap legends (density/weight/contrib) with min/max scaling.
+- Per-ray sample isolation (pick ray -> display only its samples).
+- Optional depth fade and alpha controls for dense samples.
 
 ---------------------------------------------------------------------
-Milestone 3: GPU Upload for v2 Streams
+Milestone 8: Deep Inspection UX
 ---------------------------------------------------------------------
-- Add GPU buffer allocators for:
-  - Ray base records.
-  - Sample records + sample evals.
-  - Attribute streams (SoA-friendly).
-- Provide GPU descriptors for attribute streams (dynamic binding).
-- Deliverable: GPU-side data mirrors v2 schema.
+- Ray picking in 3D + pinned detail panel.
+- Sample table with omit reasons + contribution breakdown.
+- Histograms (density/weight/transmittance).
 
 ---------------------------------------------------------------------
-Milestone 4: GPU Filter + Prefix-Sum Compaction
+Milestone 9: Performance + Streaming
 ---------------------------------------------------------------------
-- Implement filter kernel (state, omit reason, ROI, mask, batch id).
-- Implement scan/compaction pipeline to produce compact ray list.
-- Build indirect draw args from compacted counts.
-- Deliverable: filters affect render without CPU bottlenecks.
+- Frame prefetch queue + LRU cache for GPU buffers.
+- Dynamic LOD while camera moves (auto stride for rays/samples).
+- Optional streaming playback hooks.
 
 ---------------------------------------------------------------------
-Milestone 5: Rendering Modes for Debug Data
----------------------------------------------------------------------
-- Ray color modes: direction, mask id, batch id, depth, flags.
-- Sample visualization: points + heatmaps + omit/keep markers.
-- Per-ray overlay of final pixel contribution.
-- Deliverable: visual inspection of sample contributions.
-
----------------------------------------------------------------------
-Milestone 6: Deep Inspection UX
----------------------------------------------------------------------
-- Ray picking and per-ray detail panel.
-- Sample list view with omit reasons + contribution breakdown.
-- Histogram panels (density, weight, transmittance).
-- Deliverable: structured per-ray debugging workflow.
-
----------------------------------------------------------------------
-Milestone 7: Performance + Streaming
----------------------------------------------------------------------
-- Frame prefetch queue + LRU cache.
-- Optional streaming recorder for live sessions.
-- Dynamic LOD while camera moves (auto stride).
-- Deliverable: smooth playback on large datasets.
-
----------------------------------------------------------------------
-Milestone 8: Export + Diagnostics
+Milestone 10: Export + Diagnostics
 ---------------------------------------------------------------------
 - Export selected rays/samples to CSV/JSON.
 - Snapshot capture of current debug state.
-- Performance metrics (upload, filter, draw timings).
-- Deliverable: reproducible debug artifacts.
+- GPU timing (upload/filter/draw) overlay.
 
 ---------------------------------------------------------------------
 Key Risks / Mitigations
 ---------------------------------------------------------------------
-- Schema complexity -> strict validator + schema hash.
-- Large data size -> attribute streams + optional compression.
-- GPU memory pressure -> chunked uploads + LRU cache.
+- Large data size -> index-based sample compaction + LRU cache.
+- GPU memory pressure -> chunked uploads and per-frame buffer reuse.
+- Attribute explosion -> typed views + optional compression.
 
 ---------------------------------------------------------------------
-Decision Points (Before Milestone 1)
+Upcoming Decisions
 ---------------------------------------------------------------------
-- Final list of omit/termination reasons.
-- Required attribute streams (ray/sample/result).
-- Expected scale: rays/frame and samples/ray.
+- Sample compaction output (indices-only vs packed structs).
+- Attribute naming conventions (e.g., `mask_id`, `batch_id`) and formats.
+- Preferred picking mode (screen-space pick vs nearest-ray in world).

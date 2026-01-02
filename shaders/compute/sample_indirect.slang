@@ -1,0 +1,27 @@
+// ============================================================================
+// Build a VkDrawIndirectCommand for sample point drawing.
+// ============================================================================
+struct DrawIndirectCommand {
+    uint vertexCount;
+    uint instanceCount;
+    uint firstVertex;
+    uint firstInstance;
+};
+
+[[vk::binding(0, 0)]]
+StructuredBuffer<uint> in_count;
+[[vk::binding(1, 0)]]
+RWStructuredBuffer<DrawIndirectCommand> out_draw;
+
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void compMain(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x > 0) return;
+    const uint samples = in_count[0];
+    DrawIndirectCommand cmd;
+    cmd.vertexCount   = samples;
+    cmd.instanceCount = 1u;
+    cmd.firstVertex   = 0u;
+    cmd.firstInstance = 0u;
+    out_draw[0] = cmd;
+}

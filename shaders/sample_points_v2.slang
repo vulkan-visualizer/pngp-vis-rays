@@ -52,6 +52,8 @@ StructuredBuffer<RayBaseRecordV2> rays;
 StructuredBuffer<SampleRecordV2> samples;
 [[vk::binding(2, 0)]]
 StructuredBuffer<SampleEvalV2> evals;
+[[vk::binding(3, 0)]]
+StructuredBuffer<uint> sample_indices;
 
 struct VsOut {
     float4 position : SV_Position;
@@ -90,13 +92,14 @@ VsOut vertMain(uint vertex_id : SV_VertexID) {
         return o;
     }
 
-    const SampleRecordV2 s = samples[idx];
+    const uint sample_index = sample_indices[idx];
+    const SampleRecordV2 s = samples[sample_index];
     const RayBaseRecordV2 r = rays[s.ray_index];
     const float3 pos = r.origin + r.direction * s.t;
 
     const uint state = s.state_omit & 0xFFu;
     const uint omit = (s.state_omit >> 8u) & 0xFFu;
-    const SampleEvalV2 e = evals[idx];
+    const SampleEvalV2 e = evals[sample_index];
 
     float3 color = state_color(state);
     if (push.mode == 1u) {

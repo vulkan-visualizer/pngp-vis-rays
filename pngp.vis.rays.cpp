@@ -533,10 +533,16 @@ namespace {
                 .descriptorCount = 1,
                 .stageFlags      = vk::ShaderStageFlagBits::eVertex,
             },
+            {
+                .binding         = 3,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .descriptorCount = 1,
+                .stageFlags      = vk::ShaderStageFlagBits::eVertex,
+            },
         };
 
         const vk::DescriptorSetLayoutCreateInfo ci{
-            .bindingCount = static_cast<std::uint32_t>(std::size(bindings)),
+            .bindingCount = static_cast<std::uint32_t>(std::size(bindings)),    
             .pBindings    = bindings,
         };
         return vk::raii::DescriptorSetLayout{device, ci};
@@ -545,7 +551,7 @@ namespace {
     vk::raii::DescriptorPool create_sample_pool(const vk::raii::Device& device) {
         const vk::DescriptorPoolSize pool_size{
             .type            = vk::DescriptorType::eStorageBuffer,
-            .descriptorCount = 3,
+            .descriptorCount = 4,
         };
         const vk::DescriptorPoolCreateInfo ci{
             .flags         = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
@@ -572,10 +578,12 @@ namespace {
                            const vk::raii::DescriptorSet& set,
                            const vk::memory::Buffer& rays,
                            const vk::memory::Buffer& samples,
-                           const vk::memory::Buffer& evals) {
-        const vk::DescriptorBufferInfo ray_info{*rays.buffer, 0, rays.size};
+                           const vk::memory::Buffer& evals,
+                           const vk::memory::Buffer& indices) {
+        const vk::DescriptorBufferInfo ray_info{*rays.buffer, 0, rays.size};    
         const vk::DescriptorBufferInfo sample_info{*samples.buffer, 0, samples.size};
         const vk::DescriptorBufferInfo eval_info{*evals.buffer, 0, evals.size};
+        const vk::DescriptorBufferInfo index_info{*indices.buffer, 0, indices.size};
         const vk::WriteDescriptorSet writes[] = {
             {
                 .dstSet          = *set,
@@ -597,6 +605,13 @@ namespace {
                 .descriptorCount = 1,
                 .descriptorType  = vk::DescriptorType::eStorageBuffer,
                 .pBufferInfo     = &eval_info,
+            },
+            {
+                .dstSet          = *set,
+                .dstBinding      = 3,
+                .descriptorCount = 1,
+                .descriptorType  = vk::DescriptorType::eStorageBuffer,
+                .pBufferInfo     = &index_info,
             },
         };
         device.updateDescriptorSets(writes, {});
@@ -659,6 +674,33 @@ namespace {
         if (indirect.size == 0) {
             indirect = create_device_buffer(vkctx, sizeof(vk::DrawIndirectCommand),
                                             vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eIndirectBuffer);
+        }
+    }
+
+    void ensure_sample_buffers(const vk::context::VulkanContext& vkctx,
+                               const std::uint32_t desired_capacity,
+                               vk::memory::Buffer& indices,
+                               vk::memory::Buffer& count,
+                               vk::memory::Buffer& indirect,
+                               std::uint32_t& capacity) {
+        const std::uint32_t safe_capacity = std::max(1u, desired_capacity);
+        if (safe_capacity > capacity || indices.size == 0) {
+            const vk::DeviceSize size_bytes =
+                static_cast<vk::DeviceSize>(safe_capacity) * sizeof(std::uint32_t);
+            indices = create_device_buffer(vkctx, size_bytes, vk::BufferUsageFlagBits::eStorageBuffer);
+            capacity = safe_capacity;
+        }
+
+        if (count.size == 0) {
+            count = create_device_buffer(vkctx, sizeof(std::uint32_t),
+                                         vk::BufferUsageFlagBits::eStorageBuffer |
+                                             vk::BufferUsageFlagBits::eTransferDst);
+        }
+
+        if (indirect.size == 0) {
+            indirect = create_device_buffer(vkctx, sizeof(vk::DrawIndirectCommand),
+                                            vk::BufferUsageFlagBits::eStorageBuffer |
+                                                vk::BufferUsageFlagBits::eIndirectBuffer);
         }
     }
 } // namespace
@@ -744,12 +786,17 @@ void pngp::vis::rays::RaysInspector::run() {
             v2_samples    = {};
             v2_evals      = {};
             v2_results    = {};
+            sample_indices = {};
+            sample_count   = {};
+            sample_indirect = {};
+            sample_capacity = 0;
             v2_attribute_buffers.clear();
             v2_attribute_sets.clear();
             v2_attribute_pool = vk::raii::DescriptorPool{nullptr};
             v2_attribute_capacity = 0;
             rays.roi_initialized = false;
             record_error.clear();
+            sample_filter_dirty = true;
         }
 
         if (request_open_record) {
@@ -773,6 +820,10 @@ void pngp::vis::rays::RaysInspector::run() {
                         v2_samples    = {};
                         v2_evals      = {};
                         v2_results    = {};
+                        sample_indices = {};
+                        sample_count   = {};
+                        sample_indirect = {};
+                        sample_capacity = 0;
                         v2_attribute_buffers.clear();
                         v2_attribute_sets.clear();
                         v2_attribute_pool = vk::raii::DescriptorPool{nullptr};
@@ -785,6 +836,7 @@ void pngp::vis::rays::RaysInspector::run() {
                     active_frame_index = 0;
                     request_frame_upload = true;
                     filter_dirty = true;
+                    sample_filter_dirty = true;
                 } catch (const std::exception& e) {
                     record_error = e.what();
                     record_v2_reader.close();
@@ -852,9 +904,26 @@ void pngp::vis::rays::RaysInspector::run() {
                     update_ray_set(ctx.device, ray_set, ray_filtered, result_buf, mask_buf, batch_buf);
                     const auto& eval_buf = v2_evals.size > 0 ? v2_evals : dummy_storage;
                     const auto& ray_buf  = ray_input.buffer.size > 0 ? ray_input.buffer : dummy_storage;
-                    update_sample_set(ctx.device, sample_set, ray_buf, sample_buf, eval_buf);
+                    const auto sample_in_u64 = std::min<std::uint64_t>(active_frame_v2.sample_count,
+                                                                      std::numeric_limits<std::uint32_t>::max());
+                    const auto sample_in_count = static_cast<std::uint32_t>(sample_in_u64);
+                    if (sample_in_count > 0) {
+                        const std::uint32_t desired_samples = std::min(samples.max_samples, sample_in_count);
+                        ensure_sample_buffers(ctx, desired_samples, sample_indices, sample_count,
+                                              sample_indirect, sample_capacity);
+                    }
+                    const auto& index_buf = sample_indices.size > 0 ? sample_indices : dummy_storage;
+                    update_sample_set(ctx.device, sample_set, ray_buf, sample_buf, eval_buf, index_buf);
+                    if (sample_in_count > 0 && sample_indices.size > 0 && sample_count.size > 0 &&
+                        sample_indirect.size > 0) {
+                        filter::update_filter_set(ctx.device, sample_filter_bindings, ray_input.buffer,
+                                                  sample_indices, sample_count, sample_buf, mask_buf, batch_buf);
+                        filter::update_indirect_set(ctx.device, sample_indirect_bindings, sample_count,
+                                                    sample_indirect);
+                    }
                     filter::update_indirect_set(ctx.device, indirect_bindings, ray_count, ray_indirect);
                     filter_dirty = true;
+                    sample_filter_dirty = true;
                 }
             }
         }
@@ -887,6 +956,40 @@ void pngp::vis::rays::RaysInspector::run() {
                     filter::update_indirect_set(ctx.device, indirect_bindings, ray_count, ray_indirect);
                     filter_dirty = true;
                 }
+            }
+        }
+
+        if (request_sample_resize) {
+            request_sample_resize = false;
+            const auto sample_in_u64 = std::min<std::uint64_t>(active_frame_v2.sample_count,
+                                                              std::numeric_limits<std::uint32_t>::max());
+            const auto sample_in_count = static_cast<std::uint32_t>(sample_in_u64);
+            if (sample_in_count > 0) {
+                const std::uint32_t desired_samples = std::min(samples.max_samples, sample_in_count);
+                if (desired_samples > sample_capacity) {
+                    ctx.device.waitIdle();
+                    ensure_sample_buffers(ctx, desired_samples, sample_indices, sample_count,
+                                          sample_indirect, sample_capacity);
+                    const auto& sample_buf = v2_samples.size > 0 ? v2_samples : dummy_storage;
+                    const auto& eval_buf = v2_evals.size > 0 ? v2_evals : dummy_storage;
+                    const auto& ray_buf  = ray_input.buffer.size > 0 ? ray_input.buffer : dummy_storage;
+                    const auto& mask_buf =
+                        (v2_mask_attr_index >= 0 &&
+                         static_cast<std::size_t>(v2_mask_attr_index) < v2_attribute_buffers.size())
+                            ? v2_attribute_buffers[static_cast<std::size_t>(v2_mask_attr_index)]
+                            : dummy_storage;
+                    const auto& batch_buf =
+                        (v2_batch_attr_index >= 0 &&
+                         static_cast<std::size_t>(v2_batch_attr_index) < v2_attribute_buffers.size())
+                            ? v2_attribute_buffers[static_cast<std::size_t>(v2_batch_attr_index)]
+                            : dummy_storage;
+                    filter::update_filter_set(ctx.device, sample_filter_bindings, ray_input.buffer,
+                                              sample_indices, sample_count, sample_buf, mask_buf, batch_buf);
+                    filter::update_indirect_set(ctx.device, sample_indirect_bindings, sample_count,
+                                                sample_indirect);
+                    update_sample_set(ctx.device, sample_set, ray_buf, sample_buf, eval_buf, sample_indices);
+                }
+                sample_filter_dirty = true;
             }
         }
 
@@ -1029,11 +1132,19 @@ pngp::vis::rays::RaysInspector::RaysInspector(const RaysInspectorInfo& info) {
 
     filter_pipeline  = filter::create_filter_pipeline(ctx.device);
     filter_bindings  = filter::create_filter_bindings(ctx.device);
-    filter::allocate_filter_set(ctx.device, filter_pipeline, filter_bindings);
+    filter::allocate_filter_set(ctx.device, filter_pipeline, filter_bindings);  
 
     indirect_pipeline = filter::create_indirect_pipeline(ctx.device);
     indirect_bindings = filter::create_indirect_bindings(ctx.device);
     filter::allocate_indirect_set(ctx.device, indirect_pipeline, indirect_bindings);
+
+    sample_filter_pipeline = filter::create_sample_filter_pipeline(ctx.device);
+    sample_filter_bindings = filter::create_filter_bindings(ctx.device);
+    filter::allocate_filter_set(ctx.device, sample_filter_pipeline, sample_filter_bindings);
+
+    sample_indirect_pipeline = filter::create_sample_indirect_pipeline(ctx.device);
+    sample_indirect_bindings = filter::create_indirect_bindings(ctx.device);
+    filter::allocate_indirect_set(ctx.device, sample_indirect_pipeline, sample_indirect_bindings);
 }
 
 // ============================================================================
@@ -1097,6 +1208,16 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
                               ray_filtered.size > 0 && ray_count.size > 0 && ray_indirect.size > 0;
     const std::uint32_t ray_stride  = std::max(1u, rays.stride);
     const std::uint32_t ray_max_out = std::min(std::min(rays.max_rays, ray_capacity), in_count);
+
+    const auto sample_in_u64 = std::min<std::uint64_t>(active_frame_v2.sample_count,
+                                                       std::numeric_limits<std::uint32_t>::max());
+    const auto sample_in_count = static_cast<std::uint32_t>(sample_in_u64);
+    const bool sample_can_dispatch =
+        samples.show_samples && sample_in_count > 0 && sample_capacity > 0 && sample_indices.size > 0 &&
+        sample_count.size > 0 && sample_indirect.size > 0;
+    const std::uint32_t sample_stride  = std::max(1u, samples.stride);
+    const std::uint32_t sample_max_out =
+        std::min(std::min(samples.max_samples, sample_capacity), sample_in_count);
 
     if (can_dispatch && ray_max_out > 0 && filter_dirty) {
         cmd.fillBuffer(*ray_count.buffer, 0, ray_count.size, 0);
@@ -1207,6 +1328,115 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
         filter_dirty = false;
     }
 
+    if (sample_can_dispatch && sample_max_out > 0 && sample_filter_dirty) {
+        cmd.fillBuffer(*sample_count.buffer, 0, sample_count.size, 0);
+
+        const vk::BufferMemoryBarrier2 clear_barrier{
+            .srcStageMask  = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+            .buffer        = *sample_count.buffer,
+            .offset        = 0,
+            .size          = sample_count.size,
+        };
+
+        const vk::DependencyInfo clear_dep{
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers    = &clear_barrier,
+        };
+        cmd.pipelineBarrier2(clear_dep);
+
+        filter::FilterParams params{};
+        params.in_count = sample_in_count;
+        params.stride   = sample_stride;
+        params.max_out  = sample_max_out;
+        params.flags    = 0;
+        params.sample_state_mask = 0;
+        params.omit_reason_mask  = 0;
+        params.mask_id  = rays.mask_id;
+        params.batch_id = rays.batch_id;
+
+        const std::uint32_t frame_width = active_frame_v2.width;
+        const std::uint32_t frame_height = active_frame_v2.height;
+        const int max_x = frame_width > 0 ? static_cast<int>(frame_width - 1) : 0;
+        const int max_y = frame_height > 0 ? static_cast<int>(frame_height - 1) : 0;
+        int roi_min_x = std::clamp(rays.roi_min_x, 0, max_x);
+        int roi_min_y = std::clamp(rays.roi_min_y, 0, max_y);
+        int roi_max_x = std::clamp(rays.roi_max_x, 0, max_x);
+        int roi_max_y = std::clamp(rays.roi_max_y, 0, max_y);
+        if (roi_min_x > roi_max_x) std::swap(roi_min_x, roi_max_x);
+        if (roi_min_y > roi_max_y) std::swap(roi_min_y, roi_max_y);
+        params.roi_min_x = static_cast<std::uint32_t>(roi_min_x);
+        params.roi_min_y = static_cast<std::uint32_t>(roi_min_y);
+        params.roi_max_x = static_cast<std::uint32_t>(roi_max_x);
+        params.roi_max_y = static_cast<std::uint32_t>(roi_max_y);
+
+        if (rays.roi_enabled && frame_width > 0 && frame_height > 0) {
+            params.flags |= k_filter_roi;
+        }
+        if ((rays.filter_sample_state || rays.filter_omit_reason) && v2_samples.size > 0) {
+            params.flags |= k_filter_sample;
+            params.sample_state_mask = rays.filter_sample_state ? rays.sample_state_mask : 0u;
+            params.omit_reason_mask  = rays.filter_omit_reason ? rays.omit_reason_mask : 0u;
+        }
+        if (rays.filter_mask_id && v2_mask_attr_index >= 0) {
+            params.flags |= k_filter_mask_id;
+        }
+        if (rays.filter_batch_id && v2_batch_attr_index >= 0) {
+            params.flags |= k_filter_batch_id;
+        }
+
+        const std::uint32_t group_count = (sample_in_count + 255u) / 256u;
+        filter::dispatch_filter(cmd, sample_filter_pipeline, sample_filter_bindings, params, group_count);
+
+        const vk::BufferMemoryBarrier2 count_barrier{
+            .srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+            .dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .buffer        = *sample_count.buffer,
+            .offset        = 0,
+            .size          = sample_count.size,
+        };
+
+        const vk::DependencyInfo count_dep{
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers    = &count_barrier,
+        };
+        cmd.pipelineBarrier2(count_dep);
+
+        filter::dispatch_indirect(cmd, sample_indirect_pipeline, sample_indirect_bindings);
+
+        const vk::BufferMemoryBarrier2 barriers[] = {
+            {
+                .srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader,
+                .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                .dstStageMask  = vk::PipelineStageFlagBits2::eVertexShader,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                .buffer        = *sample_indices.buffer,
+                .offset        = 0,
+                .size          = sample_indices.size,
+            },
+            {
+                .srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader,
+                .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                .dstStageMask  = vk::PipelineStageFlagBits2::eDrawIndirect,
+                .dstAccessMask = vk::AccessFlagBits2::eIndirectCommandRead,
+                .buffer        = *sample_indirect.buffer,
+                .offset        = 0,
+                .size          = sample_indirect.size,
+            },
+        };
+
+        const vk::DependencyInfo sample_dep{
+            .bufferMemoryBarrierCount = static_cast<std::uint32_t>(std::size(barriers)),
+            .pBufferMemoryBarriers    = barriers,
+        };
+        cmd.pipelineBarrier2(sample_dep);
+        sample_filter_dirty = false;
+    }
+
     // ========================================================================
     // Clear targets: black background + default depth.
     // ========================================================================
@@ -1284,22 +1514,18 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
     }
 
     // ========================================================================
-    // Sample draw: v2 sample points (no compaction yet).
+    // Sample draw: v2 sample points (GPU compaction + indirect draw).
     // ========================================================================
-    if (record_v2_reader.is_open() && samples.show_samples && v2_samples.size > 0) {
-        const auto sample_count_u64 = std::min<std::uint64_t>(active_frame_v2.sample_count,
-                                                             std::numeric_limits<std::uint32_t>::max());
-        const auto max_samples = std::max(1u, samples.max_samples);
-        const auto draw_count = static_cast<std::uint32_t>(std::min<std::uint64_t>(sample_count_u64, max_samples));
-        if (draw_count > 0) {
-            cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *sample_pipeline.pipeline);
-            cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *sample_pipeline.layout, 0, {*sample_set}, {});
-            const SamplePush push = make_sample_push(samples, grid_mvp);
-            cmd.pushConstants(*sample_pipeline.layout,
-                              vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-                              vk::ArrayProxy<const SamplePush>{push});
-            cmd.draw(draw_count, 1, 0, 0);
-        }
+    const bool sample_draw_ready = sample_can_dispatch && v2_samples.size > 0;
+    if (record_v2_reader.is_open() && sample_draw_ready) {
+        cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *sample_pipeline.pipeline);
+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *sample_pipeline.layout, 0, {*sample_set}, {});
+        SamplePush push = make_sample_push(samples, grid_mvp);
+        push.stride = 1u;
+        cmd.pushConstants(*sample_pipeline.layout,
+                          vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+                          vk::ArrayProxy<const SamplePush>{push});
+        cmd.drawIndirect(*sample_indirect.buffer, 0, 1, sizeof(vk::DrawIndirectCommand));
     }
 
     cmd.endRendering();
@@ -1478,6 +1704,7 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
     ImGui::TextUnformatted("Advanced Filters");
     if (ImGui::Checkbox("Enable ROI", &rays.roi_enabled)) {
         filter_dirty = true;
+        sample_filter_dirty = true;
     }
     if (rays.roi_enabled) {
         int roi_min[2] = {rays.roi_min_x, rays.roi_min_y};
@@ -1486,11 +1713,13 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
             rays.roi_min_x = std::clamp(roi_min[0], 0, max_x);
             rays.roi_min_y = std::clamp(roi_min[1], 0, max_y);
             filter_dirty = true;
+            sample_filter_dirty = true;
         }
         if (ImGui::InputInt2("ROI max", roi_max)) {
             rays.roi_max_x = std::clamp(roi_max[0], 0, max_x);
             rays.roi_max_y = std::clamp(roi_max[1], 0, max_y);
             filter_dirty = true;
+            sample_filter_dirty = true;
         }
     }
 
@@ -1499,6 +1728,7 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
     ImGui::BeginDisabled(!v2_sample_available);
     if (ImGui::Checkbox("Filter sample state", &rays.filter_sample_state)) {
         filter_dirty = true;
+        sample_filter_dirty = true;
     }
     if (rays.filter_sample_state) {
         std::uint32_t mask = rays.sample_state_mask;
@@ -1509,24 +1739,29 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
         if (ImGui::Checkbox("State: candidate", &candidate)) {
             mask = candidate ? (mask | (1u << 0)) : (mask & ~(1u << 0));
             filter_dirty = true;
+            sample_filter_dirty = true;
         }
         if (ImGui::Checkbox("State: kept", &kept)) {
             mask = kept ? (mask | (1u << 1)) : (mask & ~(1u << 1));
             filter_dirty = true;
+            sample_filter_dirty = true;
         }
         if (ImGui::Checkbox("State: omitted", &omitted)) {
             mask = omitted ? (mask | (1u << 2)) : (mask & ~(1u << 2));
             filter_dirty = true;
+            sample_filter_dirty = true;
         }
         if (ImGui::Checkbox("State: terminated", &term)) {
             mask = term ? (mask | (1u << 3)) : (mask & ~(1u << 3));
             filter_dirty = true;
+            sample_filter_dirty = true;
         }
         rays.sample_state_mask = mask;
     }
 
     if (ImGui::Checkbox("Filter omit reason", &rays.filter_omit_reason)) {
         filter_dirty = true;
+        sample_filter_dirty = true;
     }
     if (rays.filter_omit_reason) {
         std::uint32_t mask = rays.omit_reason_mask;
@@ -1545,6 +1780,7 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
             if (ImGui::Checkbox(labels[i], &on)) {
                 mask = on ? (mask | (1u << i)) : (mask & ~(1u << i));
                 filter_dirty = true;
+                sample_filter_dirty = true;
             }
         }
         rays.omit_reason_mask = mask;
@@ -1556,12 +1792,14 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
     ImGui::BeginDisabled(!has_mask_attr);
     if (ImGui::Checkbox("Filter mask id", &rays.filter_mask_id)) {
         filter_dirty = true;
+        sample_filter_dirty = true;
     }
     if (rays.filter_mask_id) {
         int value = static_cast<int>(rays.mask_id);
         if (ImGui::InputInt("Mask id", &value)) {
             rays.mask_id = static_cast<std::uint32_t>(std::max(0, value));
             filter_dirty = true;
+            sample_filter_dirty = true;
         }
     }
     ImGui::EndDisabled();
@@ -1569,12 +1807,14 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
     ImGui::BeginDisabled(!has_batch_attr);
     if (ImGui::Checkbox("Filter batch id", &rays.filter_batch_id)) {
         filter_dirty = true;
+        sample_filter_dirty = true;
     }
     if (rays.filter_batch_id) {
         int value = static_cast<int>(rays.batch_id);
         if (ImGui::InputInt("Batch id", &value)) {
             rays.batch_id = static_cast<std::uint32_t>(std::max(0, value));
             filter_dirty = true;
+            sample_filter_dirty = true;
         }
     }
     ImGui::EndDisabled();
@@ -1582,18 +1822,23 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
     ImGui::Separator();
     ImGui::TextUnformatted("Sample Visualization (v2)");
     ImGui::BeginDisabled(!record_v2_reader.is_open());
-    ImGui::Checkbox("Show samples", &samples.show_samples);
+    if (ImGui::Checkbox("Show samples", &samples.show_samples)) {
+        sample_filter_dirty = true;
+    }
     ImGui::SliderFloat("Point size", &samples.point_size, 0.5f, 10.0f);
     {
         int stride = static_cast<int>(samples.stride);
         if (ImGui::SliderInt("Sample stride", &stride, 1, 64)) {
             samples.stride = static_cast<std::uint32_t>(stride);
+            sample_filter_dirty = true;
         }
     }
     {
         int max_samples = static_cast<int>(samples.max_samples);
         if (ImGui::SliderInt("Max samples", &max_samples, 1, 5000000)) {
             samples.max_samples = static_cast<std::uint32_t>(max_samples);
+            request_sample_resize = true;
+            sample_filter_dirty = true;
         }
     }
     {

@@ -210,6 +210,10 @@ namespace pngp::vis::rays {
         vk::memory::Buffer v2_samples{};
         vk::memory::Buffer v2_evals{};
         vk::memory::Buffer v2_results{};
+        vk::memory::Buffer sample_indices{};
+        vk::memory::Buffer sample_count{};
+        vk::memory::Buffer sample_indirect{};
+        std::uint32_t sample_capacity = 0;
         vk::memory::Buffer dummy_storage{};
         std::vector<vk::memory::Buffer> v2_attribute_buffers{};
         std::uint32_t v2_attribute_capacity = 0;
@@ -218,6 +222,10 @@ namespace pngp::vis::rays {
         filter::FilterBindings filter_bindings{};
         filter::IndirectPipeline indirect_pipeline{};
         filter::IndirectBindings indirect_bindings{};
+        filter::FilterPipeline sample_filter_pipeline{};
+        filter::FilterBindings sample_filter_bindings{};
+        filter::IndirectPipeline sample_indirect_pipeline{};
+        filter::IndirectBindings sample_indirect_bindings{};
 
         vk::raii::DescriptorSetLayout ray_set_layout{nullptr};
         vk::raii::DescriptorPool ray_pool{nullptr};
@@ -243,7 +251,9 @@ namespace pngp::vis::rays {
         bool request_close_record = false;
         bool request_frame_upload = false;
         bool request_ray_resize   = false;
+        bool request_sample_resize = false;
         bool filter_dirty         = true;
+        bool sample_filter_dirty  = true;
         // ====================================================================
         // UI + input state.
         // ====================================================================
