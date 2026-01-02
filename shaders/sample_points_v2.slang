@@ -58,7 +58,7 @@ StructuredBuffer<uint> sample_indices;
 struct VsOut {
     float4 position : SV_Position;
     float4 color : COLOR0;
-    float point_size : PSIZE;
+    float point_size : SV_PointSize;
 };
 
 float3 state_color(uint state) {
