@@ -10,6 +10,9 @@ Current Baseline (Implemented)
 - GPU upload for rays, samples, evals, results, and attribute streams.
 - GPU ray filter (ROI/state/omit/mask/batch) + prefix-sum compaction + indirect draw.
 - Ray color modes (direction/flags/mask/batch/result/depth) + sample point visualization.
+- GPU sample filter + prefix-sum compaction (indices) + indirect draw.
+- Sample heatmaps with min/max ranges + alpha/depth fade + per-ray isolation.
+- Ray picking + pinned inspection (tables + histograms).
 
 ---------------------------------------------------------------------
 Completed Milestones
@@ -33,29 +36,29 @@ Milestone 5: Rendering Modes for Debug Data - DONE
 - Ray color modes + v2 sample point visualization.
 
 ---------------------------------------------------------------------
-Milestone 6: GPU Sample Compaction + Indirect Draw (Next)
+Milestone 6: GPU Sample Compaction + Indirect Draw - DONE
 ---------------------------------------------------------------------
-- Build sample filter kernel (state/omit/ROI by parent ray, optional masks).
+- Sample filter kernel (state/omit/ROI by parent ray, optional masks).
 - Prefix-sum compaction of sample indices (avoid moving full structs).
 - Indirect draw for sample points using compacted index buffer.
 - Deliverable: sample visualization stays fast on large datasets.
 
 ---------------------------------------------------------------------
-Milestone 7: Sample Visualization Upgrades
+Milestone 7: Sample Visualization Upgrades - DONE
 ---------------------------------------------------------------------
 - Heatmap legends (density/weight/contrib) with min/max scaling.
-- Per-ray sample isolation (pick ray -> display only its samples).
+- Per-ray sample isolation (select a ray -> display only its samples).
 - Optional depth fade and alpha controls for dense samples.
 
 ---------------------------------------------------------------------
-Milestone 8: Deep Inspection UX
+Milestone 8: Deep Inspection UX - DONE
 ---------------------------------------------------------------------
 - Ray picking in 3D + pinned detail panel.
 - Sample table with omit reasons + contribution breakdown.
-- Histograms (density/weight/transmittance).
+- Histograms for sample state/omit + value plots.
 
 ---------------------------------------------------------------------
-Milestone 9: Performance + Streaming
+Milestone 9: Performance + Streaming (Next)
 ---------------------------------------------------------------------
 - Frame prefetch queue + LRU cache for GPU buffers.
 - Dynamic LOD while camera moves (auto stride for rays/samples).
@@ -78,6 +81,6 @@ Key Risks / Mitigations
 ---------------------------------------------------------------------
 Upcoming Decisions
 ---------------------------------------------------------------------
-- Sample compaction output (indices-only vs packed structs).
 - Attribute naming conventions (e.g., `mask_id`, `batch_id`) and formats.
 - Preferred picking mode (screen-space pick vs nearest-ray in world).
+- UI direction for sample heatmaps (legend placement and scaling presets).

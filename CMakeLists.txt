@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(vulkan_visualizer VERSION 1.2.0 LANGUAGES CXX)
+project(pngp-vis-rays VERSION 1.0.0 LANGUAGES CXX)
 
 # ============================================================================
 # C++ Configuration

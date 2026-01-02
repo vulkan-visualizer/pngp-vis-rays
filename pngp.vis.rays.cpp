@@ -27,6 +27,7 @@ namespace {
     constexpr std::uint32_t k_filter_sample    = 1u << 1;
     constexpr std::uint32_t k_filter_mask_id   = 1u << 2;
     constexpr std::uint32_t k_filter_batch_id  = 1u << 3;
+    constexpr std::uint32_t k_filter_ray_index = 1u << 4;
 
     // =========================================================================
     // GLFW input callbacks: collect raw input into InputState.
@@ -102,6 +103,8 @@ namespace {
     struct SamplePush {
         vk::math::mat4 mvp{};
         vk::math::vec4 params{};
+        vk::math::vec4 depth{};
+        vk::math::vec4 camera{};
         std::uint32_t mode{};
         std::uint32_t stride{};
         std::uint32_t pad0{};
@@ -207,16 +210,308 @@ namespace {
     }
 
     SamplePush make_sample_push(const pngp::vis::rays::SampleSettings& samples,
-                                const vk::math::mat4& mvp) {
+                                const vk::math::mat4& mvp,
+                                const vk::math::vec3& cam_pos) {
+        float range_min = 0.0f;
+        float range_max = 1.0f;
+        switch (samples.color_mode) {
+            case pngp::vis::rays::SampleColorMode::Density:
+                range_min = samples.density_min;
+                range_max = samples.density_max;
+                break;
+            case pngp::vis::rays::SampleColorMode::Weight:
+                range_min = samples.weight_min;
+                range_max = samples.weight_max;
+                break;
+            case pngp::vis::rays::SampleColorMode::Contrib:
+                range_min = samples.contrib_min;
+                range_max = samples.contrib_max;
+                break;
+            default:
+                break;
+        }
+
+        const float alpha = std::clamp(samples.alpha, 0.0f, 1.0f);
+        float fade_near = std::max(0.0f, samples.depth_fade_near);
+        float fade_far  = std::max(fade_near + 0.001f, samples.depth_fade_far);
+        const float fade_power = std::max(0.01f, samples.depth_fade_power);
+        const float fade_enable = samples.depth_fade ? 1.0f : 0.0f;
+
         SamplePush push{};
         push.mvp = mvp;
         push.params = {std::max(0.5f, samples.point_size),
-                       std::max(0.0f, samples.density_scale),
-                       std::max(0.0f, samples.weight_scale),
-                       std::max(0.0f, samples.contrib_scale)};
+                       range_min,
+                       range_max,
+                       alpha};
+        push.depth  = {fade_near, fade_far, fade_power, fade_enable};
+        push.camera = {cam_pos.x, cam_pos.y, cam_pos.z, 0.0f};
         push.mode   = static_cast<std::uint32_t>(samples.color_mode);
         push.stride = std::max(1u, samples.stride);
         return push;
+    }
+
+    vk::math::vec3 heatmap_color(const float t) {
+        const float u = std::clamp(t, 0.0f, 1.0f);
+        const vk::math::vec3 c0{0.10f, 0.20f, 0.90f, 0.0f};
+        const vk::math::vec3 c1{0.00f, 0.80f, 0.90f, 0.0f};
+        const vk::math::vec3 c2{0.20f, 0.90f, 0.40f, 0.0f};
+        const vk::math::vec3 c3{0.95f, 0.90f, 0.20f, 0.0f};
+        const vk::math::vec3 c4{0.90f, 0.20f, 0.20f, 0.0f};
+        const float scaled = u * 4.0f;
+        const int idx = std::clamp(static_cast<int>(scaled), 0, 3);
+        const float f = scaled - static_cast<float>(idx);
+        const auto lerp = [f](vk::math::vec3 a, vk::math::vec3 b) {
+            return vk::math::vec3{
+                a.x + (b.x - a.x) * f,
+                a.y + (b.y - a.y) * f,
+                a.z + (b.z - a.z) * f,
+                0.0f,
+            };
+        };
+        if (idx == 0) return lerp(c0, c1);
+        if (idx == 1) return lerp(c1, c2);
+        if (idx == 2) return lerp(c2, c3);
+        return lerp(c3, c4);
+    }
+
+    void draw_heatmap_legend(const char* label, float min_v, float max_v) {
+        ImGui::TextUnformatted(label);
+        const float width = ImGui::CalcItemWidth();
+        const float height = 10.0f;
+        const ImVec2 pos = ImGui::GetCursorScreenPos();
+        auto* draw = ImGui::GetWindowDrawList();
+        constexpr int steps = 32;
+        for (int i = 0; i < steps; ++i) {
+            const float t0 = static_cast<float>(i) / static_cast<float>(steps);
+            const float t1 = static_cast<float>(i + 1) / static_cast<float>(steps);
+            const auto c = heatmap_color((t0 + t1) * 0.5f);
+            const ImU32 col = ImGui::ColorConvertFloat4ToU32(ImVec4(c.x, c.y, c.z, 1.0f));
+            draw->AddRectFilled({pos.x + width * t0, pos.y},
+                                {pos.x + width * t1, pos.y + height},
+                                col);
+        }
+        ImGui::Dummy(ImVec2(width, height));
+        ImGui::Text("min %.3f   max %.3f", static_cast<double>(min_v),
+                    static_cast<double>(max_v));
+    }
+
+    struct AttrU32View {
+        const std::byte* data = nullptr;
+        std::size_t bytes = 0;
+        std::uint32_t stride = 0;
+        std::uint32_t count = 0;
+        bool valid = false;
+    };
+
+    AttrU32View make_attr_u32_view(
+        std::span<const pngp::vis::rays::record_v2::AttributeStreamViewV2> attrs,
+        const int index) {
+        if (index < 0 || static_cast<std::size_t>(index) >= attrs.size()) return {};
+        const auto& attr = attrs[static_cast<std::size_t>(index)];
+        if (attr.desc.components != 1) return {};
+        if (attr.desc.format !=
+            static_cast<std::uint32_t>(pngp::vis::rays::record_v2::AttributeFormat::U32)) {
+            return {};
+        }
+        if (attr.desc.stride_bytes < sizeof(std::uint32_t)) return {};
+        if (attr.desc.count == 0 || attr.data.empty()) return {};
+        return {attr.data.data(), attr.data.size(), attr.desc.stride_bytes, attr.desc.count, true};
+    }
+
+    std::uint32_t read_attr_u32(const AttrU32View& attr, const std::uint32_t index, const std::uint32_t fallback) {
+        if (!attr.valid || index >= attr.count) return fallback;
+        const std::size_t offset = static_cast<std::size_t>(index) * attr.stride;
+        if (offset + sizeof(std::uint32_t) > attr.bytes) return fallback;
+        std::uint32_t value = fallback;
+        std::memcpy(&value, attr.data + offset, sizeof(std::uint32_t));
+        return value;
+    }
+
+    vk::math::vec3 normalize_or(vk::math::vec3 v, vk::math::vec3 fallback) {
+        const float len = vk::math::length(v);
+        if (len > 1e-6f) return vk::math::mul(v, 1.0f / len);
+        return fallback;
+    }
+
+    vk::math::vec3 make_vec3(const float x, const float y, const float z) {
+        return {x, y, z, 0.0f};
+    }
+
+    float distance_ray_segment(const vk::math::vec3& ro,
+                               const vk::math::vec3& rd,
+                               const vk::math::vec3& so,
+                               const vk::math::vec3& sd,
+                               const float seg_len,
+                               float& out_seg_t) {
+        const vk::math::vec3 r = vk::math::sub(ro, so);
+        const float a = vk::math::dot(rd, rd);
+        const float e = vk::math::dot(sd, sd);
+        const float b = vk::math::dot(rd, sd);
+        const float c = vk::math::dot(rd, r);
+        const float f = vk::math::dot(sd, r);
+        const float denom = a * e - b * b;
+
+        float s = 0.0f;
+        float t = 0.0f;
+        if (denom > 1e-6f) {
+            s = (b * f - c * e) / denom;
+            t = (a * f - b * c) / denom;
+        } else {
+            t = (e > 1e-6f) ? (f / e) : 0.0f;
+        }
+
+        t = std::clamp(t, 0.0f, std::max(0.0f, seg_len));
+        if (s < 0.0f) s = 0.0f;
+        out_seg_t = t;
+
+        const vk::math::vec3 p1 = vk::math::add(ro, vk::math::mul(rd, s));
+        const vk::math::vec3 p2 = vk::math::add(so, vk::math::mul(sd, t));
+        const vk::math::vec3 d = vk::math::sub(p1, p2);
+        return vk::math::length2(d);
+    }
+
+    bool ray_passes_filters_cpu(
+        const std::uint32_t idx,
+        const pngp::vis::rays::record_v2::FrameViewV2& view,
+        const pngp::vis::rays::record_v2::FrameIndexEntryV2& frame,
+        const pngp::vis::rays::RaySettings& rays,
+        const AttrU32View& mask_attr,
+        const AttrU32View& batch_attr) {
+        const auto& ray = view.rays[idx];
+        if (rays.roi_enabled && frame.width > 0 && frame.height > 0) {
+            const int max_x = static_cast<int>(frame.width - 1);
+            const int max_y = static_cast<int>(frame.height - 1);
+            int roi_min_x = std::clamp(rays.roi_min_x, 0, max_x);
+            int roi_min_y = std::clamp(rays.roi_min_y, 0, max_y);
+            int roi_max_x = std::clamp(rays.roi_max_x, 0, max_x);
+            int roi_max_y = std::clamp(rays.roi_max_y, 0, max_y);
+            if (roi_min_x > roi_max_x) std::swap(roi_min_x, roi_max_x);
+            if (roi_min_y > roi_max_y) std::swap(roi_min_y, roi_max_y);
+            if (ray.pixel_x < static_cast<std::uint32_t>(roi_min_x) ||
+                ray.pixel_x > static_cast<std::uint32_t>(roi_max_x) ||
+                ray.pixel_y < static_cast<std::uint32_t>(roi_min_y) ||
+                ray.pixel_y > static_cast<std::uint32_t>(roi_max_y)) {
+                return false;
+            }
+        }
+
+        if ((rays.filter_sample_state || rays.filter_omit_reason) && !view.samples.empty()) {
+            const std::size_t base = static_cast<std::size_t>(ray.sample_offset);
+            const std::size_t count = static_cast<std::size_t>(ray.sample_count);
+            if (count == 0 || base + count > view.samples.size()) return false;
+            bool any = false;
+            for (std::size_t i = 0; i < count; ++i) {
+                const auto& s = view.samples[base + i];
+                const bool state_ok = !rays.filter_sample_state ||
+                                      ((rays.sample_state_mask & (1u << s.state)) != 0u);
+                const bool omit_ok = !rays.filter_omit_reason ||
+                                     ((rays.omit_reason_mask & (1u << s.omit_reason)) != 0u);
+                if (state_ok && omit_ok) {
+                    any = true;
+                    break;
+                }
+            }
+            if (!any) return false;
+        }
+
+        if (rays.filter_mask_id && mask_attr.valid) {
+            if (read_attr_u32(mask_attr, idx, std::numeric_limits<std::uint32_t>::max()) != rays.mask_id) {
+                return false;
+            }
+        }
+
+        if (rays.filter_batch_id && batch_attr.valid) {
+            if (read_attr_u32(batch_attr, idx, std::numeric_limits<std::uint32_t>::max()) != rays.batch_id) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    vk::math::vec3 compute_pick_dir(const vk::camera::Camera& cam,
+                                    const ImVec2& mouse,
+                                    const vk::Extent2D extent) {
+        if (extent.width == 0 || extent.height == 0) {
+            return {0.0f, 0.0f, -1.0f, 0.0f};
+        }
+        const float w = static_cast<float>(extent.width);
+        const float h = static_cast<float>(extent.height);
+        const float ndc_x = (2.0f * mouse.x / w) - 1.0f;
+        const float ndc_y = 1.0f - (2.0f * mouse.y / h);
+
+        const auto& cfg = cam.config();
+        const auto& m   = cam.matrices();
+        if (cfg.projection != vk::camera::Projection::Perspective) {
+            const float sign = (cfg.convention.view_forward.sign == vk::camera::Sign::Positive) ? 1.0f : -1.0f;
+            return normalize_or(vk::math::mul(m.forward, sign), {0.0f, 0.0f, -1.0f, 0.0f});
+        }
+
+        const float aspect = w / h;
+        const float tan_half = std::tan(cfg.fov_y_rad * 0.5f);
+        const float vx = ndc_x * aspect * tan_half;
+        const float vy = ndc_y * tan_half;
+        const float vz = (cfg.convention.view_forward.sign == vk::camera::Sign::Positive) ? 1.0f : -1.0f;
+
+        const vk::math::vec3 dir = vk::math::add(
+            vk::math::add(vk::math::mul(m.right, vx), vk::math::mul(m.up, vy)),
+            vk::math::mul(m.forward, vz));
+        return normalize_or(dir, {0.0f, 0.0f, -1.0f, 0.0f});
+    }
+
+    struct PickResult {
+        int index = -1;
+        float dist2 = 0.0f;
+        float ray_t = 0.0f;
+    };
+
+    std::optional<PickResult> pick_ray_index(
+        const pngp::vis::rays::record_v2::FrameViewV2& view,
+        const pngp::vis::rays::record_v2::FrameIndexEntryV2& frame,
+        const pngp::vis::rays::RaySettings& rays,
+        const pngp::vis::rays::PickSettings& pick,
+        const vk::camera::Camera& cam,
+        const vk::Extent2D extent,
+        const ImVec2& mouse,
+        const int mask_attr_index,
+        const int batch_attr_index) {
+        if (view.rays.empty()) return std::nullopt;
+        if (pick.visible_only && !rays.show_rays) return std::nullopt;
+
+        const auto mask_attr = make_attr_u32_view(view.attributes, mask_attr_index);
+        const auto batch_attr = make_attr_u32_view(view.attributes, batch_attr_index);
+
+        const vk::math::vec3 pick_origin = cam.matrices().eye;
+        const vk::math::vec3 pick_dir = compute_pick_dir(cam, mouse, extent);
+
+        const float max_dist2 = pick.radius * pick.radius;
+        const float seg_len = std::max(0.001f, rays.line_length);
+        const std::uint32_t stride = std::max(1u, pick.stride);
+
+        PickResult best{};
+        best.dist2 = max_dist2;
+
+        for (std::uint32_t i = 0; i < view.rays.size(); i += stride) {
+            if (pick.visible_only &&
+                !ray_passes_filters_cpu(i, view, frame, rays, mask_attr, batch_attr)) {
+                continue;
+            }
+            const auto& r = view.rays[i];
+            const vk::math::vec3 ray_origin = make_vec3(r.ox, r.oy, r.oz);
+            const vk::math::vec3 ray_dir = normalize_or(make_vec3(r.dx, r.dy, r.dz),
+                                                        {0.0f, 0.0f, -1.0f, 0.0f});
+            float seg_t = 0.0f;
+            const float dist2 = distance_ray_segment(pick_origin, pick_dir, ray_origin, ray_dir,
+                                                     seg_len, seg_t);
+            if (dist2 < best.dist2) {
+                best.index = static_cast<int>(i);
+                best.dist2 = dist2;
+                best.ray_t = seg_t;
+            }
+        }
+
+        if (best.index < 0) return std::nullopt;
+        return best;
     }
 
     // =========================================================================
@@ -1045,6 +1340,31 @@ void pngp::vis::rays::RaysInspector::run() {
         grid_mvp = cam.matrices().view_proj;
 
         // ====================================================================
+        // Ray picking (screen -> world) on click.
+        // ====================================================================
+        if (pick.enable && !block_mouse && record_v2_reader.is_open() &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            const ImVec2 mouse = ImGui::GetIO().MousePos;
+            if (const auto picked = pick_ray_index(v2_view, active_frame_v2, rays, pick, cam,
+                                                   swapchain.extent, mouse,
+                                                   v2_mask_attr_index, v2_batch_attr_index)) {
+                last_picked_ray_index = picked->index;
+                last_pick_distance = std::sqrt(picked->dist2);
+                v2_ray_index = picked->index;
+                v2_sample_index = 0;
+                if (samples.isolate_ray) {
+                    sample_filter_dirty = true;
+                }
+                if (pick.auto_pin) {
+                    pinned_ray_index = picked->index;
+                    pinned_sample_index = 0;
+                }
+            } else {
+                last_picked_ray_index = -1;
+            }
+        }
+
+        // ====================================================================
         // Record GPU work for this frame (grid + ImGui).
         // ====================================================================
         record_commands(frame_index, image_index);
@@ -1248,6 +1568,8 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
         params.omit_reason_mask  = 0;
         params.mask_id  = rays.mask_id;
         params.batch_id = rays.batch_id;
+        params.ray_index = static_cast<std::uint32_t>(std::max(0, v2_ray_index));
+        params.ray_index = 0;
 
         const std::uint32_t frame_width = active_frame_v2.width;
         const std::uint32_t frame_height = active_frame_v2.height;
@@ -1277,6 +1599,9 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
         }
         if (rays.filter_batch_id && v2_batch_attr_index >= 0) {
             params.flags |= k_filter_batch_id;
+        }
+        if (samples.isolate_ray) {
+            params.flags |= k_filter_ray_index;
         }
         const std::uint32_t group_count = (in_count + 255u) / 256u;
         filter::dispatch_filter(cmd, filter_pipe, filter_bindings, params, group_count);
@@ -1520,7 +1845,7 @@ void pngp::vis::rays::RaysInspector::record_commands(std::uint32_t frame_index, 
     if (record_v2_reader.is_open() && sample_draw_ready) {
         cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *sample_pipeline.pipeline);
         cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *sample_pipeline.layout, 0, {*sample_set}, {});
-        SamplePush push = make_sample_push(samples, grid_mvp);
+        SamplePush push = make_sample_push(samples, grid_mvp, cam.matrices().eye);
         push.stride = 1u;
         cmd.pushConstants(*sample_pipeline.layout,
                           vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
@@ -1612,6 +1937,9 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
         v2_ray_index = std::clamp(v2_ray_index, 0, max_ray);
         if (ImGui::SliderInt("Ray index", &v2_ray_index, 0, max_ray)) {
             v2_sample_index = 0;
+            if (samples.isolate_ray) {
+                sample_filter_dirty = true;
+            }
         }
 
         const auto& ray = v2_view.rays[static_cast<std::size_t>(v2_ray_index)];
@@ -1820,12 +2148,46 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
     ImGui::EndDisabled();
 
     ImGui::Separator();
+    ImGui::TextUnformatted("Picking");
+    ImGui::Checkbox("Enable picking", &pick.enable);
+    ImGui::Checkbox("Visible only", &pick.visible_only);
+    ImGui::Checkbox("Auto pin", &pick.auto_pin);
+    ImGui::SliderFloat("Pick radius", &pick.radius, 0.01f, 5.0f);
+    {
+        int stride = static_cast<int>(pick.stride);
+        if (ImGui::SliderInt("Pick stride", &stride, 1, 256)) {
+            pick.stride = static_cast<std::uint32_t>(stride);
+        }
+    }
+    if (last_picked_ray_index >= 0) {
+        ImGui::Text("Last pick: %d (dist %.3f)", last_picked_ray_index, static_cast<double>(last_pick_distance));
+    } else {
+        ImGui::TextUnformatted("Last pick: none");
+    }
+    if (ImGui::Button("Pin selected ray")) {
+        pinned_ray_index = v2_ray_index;
+        pinned_sample_index = 0;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear pin")) {
+        pinned_ray_index = -1;
+    }
+
+    ImGui::Separator();
     ImGui::TextUnformatted("Sample Visualization (v2)");
     ImGui::BeginDisabled(!record_v2_reader.is_open());
     if (ImGui::Checkbox("Show samples", &samples.show_samples)) {
         sample_filter_dirty = true;
     }
     ImGui::SliderFloat("Point size", &samples.point_size, 0.5f, 10.0f);
+    ImGui::SliderFloat("Alpha", &samples.alpha, 0.0f, 1.0f);
+    if (ImGui::Checkbox("Isolate selected ray", &samples.isolate_ray)) {
+        sample_filter_dirty = true;
+    }
+    if (samples.isolate_ray) {
+        ImGui::SameLine();
+        ImGui::Text("Ray %d", v2_ray_index);
+    }
     {
         int stride = static_cast<int>(samples.stride);
         if (ImGui::SliderInt("Sample stride", &stride, 1, 64)) {
@@ -1854,15 +2216,187 @@ bool pngp::vis::rays::RaysInspector::imgui_panel() {
             samples.color_mode = static_cast<pngp::vis::rays::SampleColorMode>(mode);
         }
         if (samples.color_mode == pngp::vis::rays::SampleColorMode::Density) {
-            ImGui::SliderFloat("Density scale", &samples.density_scale, 0.0f, 10.0f);
+            float min_v = samples.density_min;
+            float max_v = samples.density_max;
+            if (ImGui::DragFloatRange2("Density range", &min_v, &max_v, 0.01f, 0.0f, 1000.0f,
+                                       "Min %.3f", "Max %.3f")) {
+                if (min_v > max_v) std::swap(min_v, max_v);
+                samples.density_min = min_v;
+                samples.density_max = max_v;
+            }
+            draw_heatmap_legend("Density heatmap", samples.density_min, samples.density_max);
         }
         if (samples.color_mode == pngp::vis::rays::SampleColorMode::Weight) {
-            ImGui::SliderFloat("Weight scale", &samples.weight_scale, 0.0f, 50.0f);
+            float min_v = samples.weight_min;
+            float max_v = samples.weight_max;
+            if (ImGui::DragFloatRange2("Weight range", &min_v, &max_v, 0.001f, 0.0f, 100.0f,
+                                       "Min %.3f", "Max %.3f")) {
+                if (min_v > max_v) std::swap(min_v, max_v);
+                samples.weight_min = min_v;
+                samples.weight_max = max_v;
+            }
+            draw_heatmap_legend("Weight heatmap", samples.weight_min, samples.weight_max);
         }
         if (samples.color_mode == pngp::vis::rays::SampleColorMode::Contrib) {
-            ImGui::SliderFloat("Contrib scale", &samples.contrib_scale, 0.0f, 10.0f);
+            float min_v = samples.contrib_min;
+            float max_v = samples.contrib_max;
+            if (ImGui::DragFloatRange2("Contrib range", &min_v, &max_v, 0.001f, 0.0f, 100.0f,
+                                       "Min %.3f", "Max %.3f")) {
+                if (min_v > max_v) std::swap(min_v, max_v);
+                samples.contrib_min = min_v;
+                samples.contrib_max = max_v;
+            }
+            draw_heatmap_legend("Contrib heatmap", samples.contrib_min, samples.contrib_max);
         }
     }
+    if (ImGui::Checkbox("Depth fade", &samples.depth_fade)) {
+        // No compaction; shader reads the new values directly.
+    }
+    if (samples.depth_fade) {
+        ImGui::SliderFloat("Fade near", &samples.depth_fade_near, 0.0f, 500.0f);
+        ImGui::SliderFloat("Fade far", &samples.depth_fade_far, 0.1f, 2000.0f);
+        ImGui::SliderFloat("Fade power", &samples.depth_fade_power, 0.1f, 4.0f);
+    }
+    ImGui::Separator();
+    ImGui::TextUnformatted("Pinned Ray");
+    const bool pinned_valid = record_v2_reader.is_open() && pinned_ray_index >= 0 &&
+                              pinned_ray_index < static_cast<int>(v2_view.rays.size());
+    if (!pinned_valid) {
+        ImGui::TextUnformatted("None");
+    } else {
+        const auto& ray = v2_view.rays[static_cast<std::size_t>(pinned_ray_index)];
+        ImGui::Text("Index: %d", pinned_ray_index);
+        ImGui::Text("Origin: %.3f %.3f %.3f", ray.ox, ray.oy, ray.oz);
+        ImGui::Text("Dir: %.3f %.3f %.3f", ray.dx, ray.dy, ray.dz);
+        ImGui::Text("Pixel: %u %u", ray.pixel_x, ray.pixel_y);
+        ImGui::Text("Samples: %u", ray.sample_count);
+        if (ray.result_index < v2_view.results.size()) {
+            const auto& res = v2_view.results[ray.result_index];
+            ImGui::Text("Result rgb: %.3f %.3f %.3f", res.r, res.g, res.b);
+            ImGui::Text("Alpha: %.3f, Depth: %.3f", res.alpha, res.depth);
+            ImGui::Text("Term: %u, Steps: %u", res.termination_reason, res.step_count);
+        }
+
+        const std::size_t sample_base = static_cast<std::size_t>(ray.sample_offset);
+        const std::size_t sample_count = static_cast<std::size_t>(ray.sample_count);
+        const bool samples_in_range =
+            sample_count > 0 && sample_base + sample_count <= v2_view.samples.size();
+        if (samples_in_range) {
+            const int max_sample = static_cast<int>(sample_count - 1);
+            pinned_sample_index = std::clamp(pinned_sample_index, 0, max_sample);
+            ImGui::SliderInt("Pinned sample", &pinned_sample_index, 0, max_sample);
+            const auto& sample = v2_view.samples[sample_base + static_cast<std::size_t>(pinned_sample_index)];
+            ImGui::Text("Sample t: %.3f, dt: %.3f", sample.t, sample.dt);
+            ImGui::Text("State: %u, Omit: %u", sample.state, sample.omit_reason);
+
+            std::array<float, 4> state_counts{};
+            std::array<float, 8> omit_counts{};
+            const std::size_t plot_limit =
+                std::min<std::size_t>(sample_count, static_cast<std::size_t>(std::max(1, pinned_plot_limit)));
+            std::vector<float> density_values;
+            std::vector<float> weight_values;
+            std::vector<float> contrib_values;
+            density_values.reserve(plot_limit);
+            weight_values.reserve(plot_limit);
+            contrib_values.reserve(plot_limit);
+
+            const bool evals_ok = sample_base + sample_count <= v2_view.evals.size();
+            for (std::size_t i = 0; i < sample_count; ++i) {
+                const auto& s = v2_view.samples[sample_base + i];
+                const std::size_t state_idx = static_cast<std::size_t>(std::min<std::uint8_t>(s.state, 3));
+                const std::size_t omit_idx = static_cast<std::size_t>(std::min<std::uint8_t>(s.omit_reason, 7));
+                state_counts[state_idx] += 1.0f;
+                omit_counts[omit_idx] += 1.0f;
+                if (evals_ok && i < plot_limit) {
+                    const auto& e = v2_view.evals[sample_base + i];
+                    density_values.push_back(e.density);
+                    weight_values.push_back(e.weight);
+                    const float contrib = std::sqrt(e.contrib_r * e.contrib_r +
+                                                    e.contrib_g * e.contrib_g +
+                                                    e.contrib_b * e.contrib_b);
+                    contrib_values.push_back(contrib);
+                }
+            }
+
+            const float state_max = *std::max_element(state_counts.begin(), state_counts.end());
+            const float omit_max = *std::max_element(omit_counts.begin(), omit_counts.end());
+            ImGui::TextUnformatted("State histogram");
+            ImGui::PlotHistogram("##state_hist", state_counts.data(), static_cast<int>(state_counts.size()), 0,
+                                 nullptr, 0.0f, state_max + 1.0f, ImVec2(0, 60));
+            ImGui::TextUnformatted("Omit histogram");
+            ImGui::PlotHistogram("##omit_hist", omit_counts.data(), static_cast<int>(omit_counts.size()), 0,
+                                 nullptr, 0.0f, omit_max + 1.0f, ImVec2(0, 60));
+
+            ImGui::SliderInt("Table rows", &pinned_table_limit, 1, 2048);
+            ImGui::SliderInt("Plot samples", &pinned_plot_limit, 1, 4096);
+            if (!density_values.empty()) {
+                const float max_density = *std::max_element(density_values.begin(), density_values.end());
+                ImGui::PlotHistogram("Density", density_values.data(), static_cast<int>(density_values.size()), 0,
+                                     nullptr, 0.0f, max_density * 1.05f, ImVec2(0, 60));
+            }
+            if (!weight_values.empty()) {
+                const float max_weight = *std::max_element(weight_values.begin(), weight_values.end());
+                ImGui::PlotHistogram("Weight", weight_values.data(), static_cast<int>(weight_values.size()), 0,
+                                     nullptr, 0.0f, max_weight * 1.05f, ImVec2(0, 60));
+            }
+            if (!contrib_values.empty()) {
+                const float max_contrib = *std::max_element(contrib_values.begin(), contrib_values.end());
+                ImGui::PlotHistogram("Contrib", contrib_values.data(), static_cast<int>(contrib_values.size()), 0,
+                                     nullptr, 0.0f, max_contrib * 1.05f, ImVec2(0, 60));
+            }
+
+            const int row_count = std::min<int>(max_sample + 1, std::max(1, pinned_table_limit));
+            const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY;
+            if (ImGui::BeginTable("PinnedSampleTable", 8, flags, ImVec2(0.0f, 240.0f))) {
+                ImGui::TableSetupColumn("i");
+                ImGui::TableSetupColumn("t");
+                ImGui::TableSetupColumn("dt");
+                ImGui::TableSetupColumn("state");
+                ImGui::TableSetupColumn("omit");
+                ImGui::TableSetupColumn("density");
+                ImGui::TableSetupColumn("weight");
+                ImGui::TableSetupColumn("contrib");
+                ImGui::TableHeadersRow();
+                for (int i = 0; i < row_count; ++i) {
+                    const auto& s = v2_view.samples[sample_base + static_cast<std::size_t>(i)];
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%d", i);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%.3f", s.t);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%.3f", s.dt);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%u", s.state);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%u", s.omit_reason);
+                    if (evals_ok) {
+                        const auto& e = v2_view.evals[sample_base + static_cast<std::size_t>(i)];
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%.3f", e.density);
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%.3f", e.weight);
+                        ImGui::TableNextColumn();
+                        const float contrib = std::sqrt(e.contrib_r * e.contrib_r +
+                                                        e.contrib_g * e.contrib_g +
+                                                        e.contrib_b * e.contrib_b);
+                        ImGui::Text("%.3f", contrib);
+                    } else {
+                        ImGui::TableNextColumn();
+                        ImGui::TextUnformatted("-");
+                        ImGui::TableNextColumn();
+                        ImGui::TextUnformatted("-");
+                        ImGui::TableNextColumn();
+                        ImGui::TextUnformatted("-");
+                    }
+                }
+                ImGui::EndTable();
+            }
+        } else {
+            ImGui::TextUnformatted("No samples available for this ray.");
+        }
+    }
+
     ImGui::EndDisabled();
 
     ImGui::End();

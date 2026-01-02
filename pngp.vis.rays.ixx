@@ -126,9 +126,29 @@ namespace pngp::vis::rays {
         std::uint32_t stride = 1;
         std::uint32_t max_samples = 300000;
         SampleColorMode color_mode = SampleColorMode::State;
-        float density_scale = 1.0f;
-        float weight_scale  = 10.0f;
-        float contrib_scale = 1.0f;
+        float density_min = 0.0f;
+        float density_max = 1.0f;
+        float weight_min  = 0.0f;
+        float weight_max  = 1.0f;
+        float contrib_min = 0.0f;
+        float contrib_max = 1.0f;
+        float alpha = 0.9f;
+        bool isolate_ray = false;
+        bool depth_fade = false;
+        float depth_fade_near  = 0.0f;
+        float depth_fade_far   = 50.0f;
+        float depth_fade_power = 1.0f;
+    };
+
+    // ========================================================================
+    // Ray picking + inspection settings.
+    // ========================================================================
+    struct PickSettings {
+        bool enable = false;
+        bool visible_only = true;
+        bool auto_pin = true;
+        float radius = 0.15f;
+        std::uint32_t stride = 4;
     };
 
     // ========================================================================
@@ -258,6 +278,13 @@ namespace pngp::vis::rays {
         // UI + input state.
         // ====================================================================
         GridSettings grid{};
+        PickSettings pick{};
+        int pinned_ray_index = -1;
+        int pinned_sample_index = 0;
+        int pinned_table_limit = 128;
+        int pinned_plot_limit = 512;
+        int last_picked_ray_index = -1;
+        float last_pick_distance = 0.0f;
         InputState input{};
     };
 } // namespace pngp::vis::rays

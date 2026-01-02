@@ -1,13 +1,13 @@
 # record_schema_v2.md
 
-NeRF Ray Debugger Record Schema (v2 Draft)
+NeRF Ray Debugger Record Schema (v2 Current)
 
 Overview
 v2 is a ray-centric schema designed for deep per-ray and per-sample debugging.
-Each ray can reference an arbitrary number of candidate samples, each sample can
-carry omit/keep state and reasons, and the pipeline can add new debug attributes
-via extensible attribute streams. The schema is optimized for random access and
-GPU-friendly uploads.
+Each ray references a variable number of samples. Samples carry state/omit
+metadata, and per-sample evaluations are stored in a separate stream. Extensible
+attribute streams allow adding new debug channels without changing fixed
+structures.
 
 Byte Order
 - Little-endian for all integer and floating-point fields.
@@ -21,7 +21,7 @@ High-Level File Layout
 2) FrameIndexEntryV2 table (frame_count entries)
 3) Section table (per-frame, typed sections)
 4) String table (null-terminated names for attributes, reasons, labels)
-5) Section payloads (ray records, sample records, attribute streams, results)
+5) Section payloads (ray records, sample records, evals, results, attributes)
 
 ---------------------------------------------------------------------
 RecordHeaderV2 (fixed 128 bytes)
@@ -150,12 +150,16 @@ SampleEvalV2 (fixed 48 bytes)
 ---------------------------------------------------------------------
 struct alignas(16) SampleEvalV2
 - density           : float32
-- color_rgb[3]      : float32
+- r, g, b            : float32 (evaluated color)
 - weight            : float32
 - transmittance     : float32
-- contrib_rgb[3]    : float32
+- contrib_r, g, b    : float32 (contribution to final pixel)
 - pad0              : float32
-- pad1[2]           : float32
+- pad1[2]            : float32
+
+Notes
+- In the current implementation, SampleEvalV2 is stored 1:1 with SampleRecordV2
+  (same index). If evals are unavailable, the section may be empty.
 
 ---------------------------------------------------------------------
 RayResultV2 (fixed 32 bytes)
@@ -216,13 +220,9 @@ Notes
 ---------------------------------------------------------------------
 - sample_offset/sample_count in RayBaseRecordV2 are indices into the
   SampleRecordV2 stream (not bytes).
-- SampleEvalV2 can be stored only for kept samples; map via stream index or an
-  additional attribute stream linking to sample indices.
 - AttributeStream sections store AttributeStreamDesc followed by data payload.
 - Each frame can reference multiple sections; section_count may be 0.
 
----------------------------------------------------------------------
 Reference Layout Tests
----------------------------------------------------------------------
 See `ray_generator/tests/record_schema_v2_layout.cpp` for static size/align
 checks of all fixed structs.

@@ -40,12 +40,15 @@ struct FilterParams {
     uint omit_reason_mask;
     uint mask_id;
     uint batch_id;
+    uint ray_index;
+    uint pad0;
 };
 
 static const uint k_filter_roi = 1u << 0;
 static const uint k_filter_sample = 1u << 1;
 static const uint k_filter_mask_id = 1u << 2;
 static const uint k_filter_batch_id = 1u << 3;
+static const uint k_filter_ray_index = 1u << 4;
 
 [[vk::push_constant]]
 cbuffer PushConstants {

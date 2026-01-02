@@ -44,10 +44,12 @@ namespace pngp::vis::rays::filter {
         std::uint32_t omit_reason_mask  = 0;
         std::uint32_t mask_id  = 0;
         std::uint32_t batch_id = 0;
+        std::uint32_t ray_index = 0;
+        std::uint32_t pad4 = 0;
     };
 
     static_assert(std::is_standard_layout_v<FilterParams>);
-    static_assert(sizeof(FilterParams) == 48);
+    static_assert(sizeof(FilterParams) == 56);
 
     // ========================================================================
     // Pipeline bundle for compute filtering.
