@@ -1,3 +1,5 @@
+module;
+#include <vulkan/vulkan_raii.hpp>
 export module pngp.vis.rays;
 // ============================================================================
 // Rays Inspector public interface.
